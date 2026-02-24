@@ -52,7 +52,7 @@ get_ssh_port() {
 
 # ---------- iptables 操作 ----------
 create_custom_chains() {
-    # 创建自定义链（如果不存在）
+    # IPv4
     if ! iptables -L TRAFFIC_IN >/dev/null 2>&1; then
         iptables -N TRAFFIC_IN
         iptables -I INPUT -j TRAFFIC_IN
@@ -61,32 +61,67 @@ create_custom_chains() {
         iptables -N TRAFFIC_OUT
         iptables -I OUTPUT -j TRAFFIC_OUT
     fi
+
+    # IPv6 (仅当系统支持 IPv6 且 ip6tables 可用时)
+    if command -v ip6tables >/dev/null 2>&1; then
+        if ! ip6tables -L TRAFFIC_IN >/dev/null 2>&1; then
+            ip6tables -N TRAFFIC_IN
+            ip6tables -I INPUT -j TRAFFIC_IN
+        fi
+        if ! ip6tables -L TRAFFIC_OUT >/dev/null 2>&1; then
+            ip6tables -N TRAFFIC_OUT
+            ip6tables -I OUTPUT -j TRAFFIC_OUT
+        fi
+    fi
 }
 
 delete_custom_chains() {
+    # IPv4
     iptables -D INPUT -j TRAFFIC_IN 2>/dev/null || true
     iptables -D OUTPUT -j TRAFFIC_OUT 2>/dev/null || true
     iptables -F TRAFFIC_IN 2>/dev/null || true
     iptables -F TRAFFIC_OUT 2>/dev/null || true
     iptables -X TRAFFIC_IN 2>/dev/null || true
     iptables -X TRAFFIC_OUT 2>/dev/null || true
+
+    # IPv6
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -D INPUT -j TRAFFIC_IN 2>/dev/null || true
+        ip6tables -D OUTPUT -j TRAFFIC_OUT 2>/dev/null || true
+        ip6tables -F TRAFFIC_IN 2>/dev/null || true
+        ip6tables -F TRAFFIC_OUT 2>/dev/null || true
+        ip6tables -X TRAFFIC_IN 2>/dev/null || true
+        ip6tables -X TRAFFIC_OUT 2>/dev/null || true
+    fi
 }
 
 # 添加监控端口规则（只计数，不干预）
 add_monitor_rule() {
     local port=$1
     local proto=$2
+    # IPv4
     iptables -A TRAFFIC_IN -p $proto --dport $port -m comment --comment "$COMMENT"
     iptables -A TRAFFIC_OUT -p $proto --sport $port -m comment --comment "$COMMENT"
-    log "添加监控端口：$port/$proto"
+    # IPv6
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -A TRAFFIC_IN -p $proto --dport $port -m comment --comment "$COMMENT" 2>/dev/null
+        ip6tables -A TRAFFIC_OUT -p $proto --sport $port -m comment --comment "$COMMENT" 2>/dev/null
+    fi
+    log "添加监控端口：$port/$proto (IPv4+IPv6)"
 }
 
 remove_monitor_rule() {
     local port=$1
     local proto=$2
+    # IPv4
     iptables -D TRAFFIC_IN -p $proto --dport $port -m comment --comment "$COMMENT" 2>/dev/null || true
     iptables -D TRAFFIC_OUT -p $proto --sport $port -m comment --comment "$COMMENT" 2>/dev/null || true
-    log "删除监控端口：$port/$proto"
+    # IPv6
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -D TRAFFIC_IN -p $proto --dport $port -m comment --comment "$COMMENT" 2>/dev/null
+        ip6tables -D TRAFFIC_OUT -p $proto --sport $port -m comment --comment "$COMMENT" 2>/dev/null
+    fi
+    log "删除监控端口：$port/$proto (IPv4+IPv6)"
 }
 
 # 获取所有监控端口列表（从配置文件）
@@ -98,34 +133,39 @@ get_monitored_ports() {
 
 # 获取所有端口的当前原始计数（字节）
 get_raw_counters() {
+    # IPv4 计数
     iptables -L TRAFFIC_IN -v -n -x | awk -v comment="$COMMENT" '
-        $0 ~ comment {
-            if ($4 == "tcp" || $4 == "udp") {
-                proto = $4
-                for (i=1; i<=NF; i++) {
-                    if ($i == "--dport") {
-                        port = $(i+1)
-                        break
-                    }
-                }
-                if (port != "") print proto":in:"port":"$2
-            }
+        $0 ~ comment && ($4=="tcp" || $4=="udp") {
+            proto=$4
+            for (i=1;i<=NF;i++) if ($i=="--dport") {port=$(i+1); break}
+            if (port!="") print proto":in:"port":"$2
         }
     '
     iptables -L TRAFFIC_OUT -v -n -x | awk -v comment="$COMMENT" '
-        $0 ~ comment {
-            if ($4 == "tcp" || $4 == "udp") {
-                proto = $4
-                for (i=1; i<=NF; i++) {
-                    if ($i == "--sport") {
-                        port = $(i+1)
-                        break
-                    }
-                }
-                if (port != "") print proto":out:"port":"$2
-            }
+        $0 ~ comment && ($4=="tcp" || $4=="udp") {
+            proto=$4
+            for (i=1;i<=NF;i++) if ($i=="--sport") {port=$(i+1); break}
+            if (port!="") print proto":out:"port":"$2
         }
     '
+
+    # IPv6 计数（如果可用）
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -L TRAFFIC_IN -v -n -x | awk -v comment="$COMMENT" '
+            $0 ~ comment && ($4=="tcp" || $4=="udp") {
+                proto=$4
+                for (i=1;i<=NF;i++) if ($i=="--dport") {port=$(i+1); break}
+                if (port!="") print proto":in:"port":"$2
+            }
+        '
+        ip6tables -L TRAFFIC_OUT -v -n -x | awk -v comment="$COMMENT" '
+            $0 ~ comment && ($4=="tcp" || $4=="udp") {
+                proto=$4
+                for (i=1;i<=NF;i++) if ($i=="--sport") {port=$(i+1); break}
+                if (port!="") print proto":out:"port":"$2
+            }
+        '
+    fi
 }
 
 # 字节数格式化
@@ -909,7 +949,8 @@ start_daemon() {
 install_dependencies() {
     local missing=()
 
-    for cmd in iptables bc pgrep ss; do
+    # 检查必要命令（增加 ip6tables）
+    for cmd in iptables ip6tables bc pgrep ss; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing+=("$cmd")
         fi
@@ -926,10 +967,10 @@ install_dependencies() {
         apk update
         for pkg in "${missing[@]}"; do
             case "$pkg" in
-                ss)       apk add iproute2 ;;
-                iptables) apk add iptables ;;
-                bc)       apk add bc ;;
-                pgrep)    apk add procps ;;
+                ss)            apk add iproute2 ;;
+                iptables|ip6tables) apk add iptables ;;  # ip6tables 也由 iptables 包提供
+                bc)            apk add bc ;;
+                pgrep)         apk add procps ;;
             esac
         done
     elif [ -f /etc/debian_version ]; then
@@ -937,10 +978,10 @@ install_dependencies() {
         apt-get update -qq
         for pkg in "${missing[@]}"; do
             case "$pkg" in
-                ss)       apt-get install -y iproute2 ;;
-                iptables) apt-get install -y iptables ;;
-                bc)       apt-get install -y bc ;;
-                pgrep)    apt-get install -y procps ;;
+                ss)            apt-get install -y iproute2 ;;
+                iptables|ip6tables) apt-get install -y iptables ;;  # 统一安装 iptables 包
+                bc)            apt-get install -y bc ;;
+                pgrep)         apt-get install -y procps ;;
             esac
         done
     else
