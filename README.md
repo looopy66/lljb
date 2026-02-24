@@ -24,13 +24,13 @@ lljb 是一个轻量级的 Linux 端口流量监控与防火墙管理脚本。�
 方法一：使用 curl（推荐）
 
 ```bash
-curl -sSL -o /usr/local/bin/lljb https://raw.githubusercontent.com/looopy66/lljb/main/lljb && sudo chmod +x /usr/local/bin/lljb && sudo bash
+curl -sSL -o /usr/local/bin/lljb https://raw.githubusercontent.com/looopy66/lljb/main/lljb && chmod +x /usr/local/bin/lljb && lljb
 ```
 
 方法二：使用 wget
 
 ```bash
-wget -qO- /usr/local/bin/lljb https://raw.githubusercontent.com/looopy66/lljb/main/lljb && sudo chmod +x /usr/local/bin/lljb && sudo bash
+wget -qO- /usr/local/bin/lljb https://raw.githubusercontent.com/looopy66/lljb/main/lljb && chmod +x /usr/local/bin/lljb && lljb
 ```
 
 方法三：手动下载
