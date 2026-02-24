@@ -114,7 +114,7 @@ sudo lljb --uninstall
 · 必须使用 root 权限运行脚本。   
 · 防火墙修改直接操作 iptables，请确保理解每条命令的含义。误操作可能导致 SSH 断开，请务必保留带外管理（VNC/IPMI）或提前测试。   
 · 守护进程的 PID 文件位于 /var/run/lljb.pid，日志位于 /var/log/lljb.log。   
-· 如果系统缺少 bc、procps 等工具，首次运行时会自动安装。
+· 如果系统缺少 bc、procps 等工具，首次运行时会自动安装。   
 · 在 Alpine Linux 中，若内核未加载 iptables 模块，需手动加载或重新编译内核。   
 
 📝 许可证
