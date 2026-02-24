@@ -357,6 +357,7 @@ show_total_traffic() {
 # 增加监听端口
 add_port() {
     clear
+    show_active_ports
     echo -e "${BLUE}--- 增加监听端口 ---${NC}"
     read -p "请输入要监控的端口号（可多个，用空格分隔）: " -a ports
     if [ ${#ports[@]} -eq 0 ]; then
