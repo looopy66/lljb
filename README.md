@@ -30,7 +30,7 @@ curl -sSL -o /usr/local/bin/lljb https://raw.githubusercontent.com/looopy66/lljb
 方法二：使用 wget
 
 ```bash
-wget -qO- /usr/local/bin/lljb https://raw.githubusercontent.com/looopy66/lljb/main/lljb && chmod +x /usr/local/bin/lljb && lljb
+wget -qO /usr/local/bin/lljb https://raw.githubusercontent.com/looopy66/lljb/main/lljb && chmod +x /usr/local/bin/lljb && lljb
 ```
 
 方法三：手动下载
