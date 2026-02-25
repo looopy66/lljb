@@ -187,6 +187,7 @@ get_raw_counters() {
 # 字节数格式化
 format_bytes() {
     local bytes=$1
+    # 确保输入为数字
     if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
         bytes=0
     fi
@@ -470,12 +471,15 @@ show_total_traffic() {
     local total_in=0
     local total_out=0
     if [ -f "$TOTAL_FILE" ] && [ -s "$TOTAL_FILE" ]; then
-        # 读取前两个数字，忽略可能的其他字段（如 last_raw）
+        # 读取文件，忽略可能的额外字段
         read -r total_in total_out _ < "$TOTAL_FILE" 2>/dev/null || true
-        # 确保变量为数字
-        total_in=${total_in:-0}
-        total_out=${total_out:-0}
     fi
+    # 确保变量为有效数字
+    total_in=${total_in:-0}
+    total_out=${total_out:-0}
+    # 防止非数字导致计算错误
+    if ! [[ "$total_in" =~ ^[0-9]+$ ]]; then total_in=0; fi
+    if ! [[ "$total_out" =~ ^[0-9]+$ ]]; then total_out=0; fi
     local total=$((total_in + total_out))
     echo "总下载(入站): $(format_bytes $total_in)"
     echo "总上传(出站): $(format_bytes $total_out)"
