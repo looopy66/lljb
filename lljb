@@ -642,6 +642,43 @@ set_default_drop_out() {
     echo -e "${GREEN}操作完成。${NC}"
     read -p "按回车键继续..."
 }
+# ---------- 一键允许所有入站 ----------
+set_default_accept_in() {
+    clear
+    echo -e "${YELLOW}即将删除所有入站拒绝规则，恢复为默认允许。${NC}"
+    read -p "确认继续？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        return
+    fi
+
+    # 删除 INPUT 链中所有 drop 规则（包括端口级 drop 和全局 drop）
+    local handles=$(nft -a list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | \
+        grep "drop" | grep "$COMMENT" | awk '{print $NF}')
+    for h in $handles; do
+        nft delete rule inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" handle $h 2>/dev/null || true
+    done
+    echo -e "${GREEN}已删除所有入站拒绝规则，现在所有入站流量将被允许（除非被其他规则阻止）。${NC}"
+    read -p "按回车键继续..."
+}
+
+# ---------- 一键允许所有出站 ----------
+set_default_accept_out() {
+    clear
+    echo -e "${YELLOW}即将删除所有出站拒绝规则，恢复为默认允许。${NC}"
+    read -p "确认继续？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        return
+    fi
+
+    # 删除 OUTPUT 链中所有 drop 规则（包括端口级 drop 和全局 drop）
+    local handles=$(nft -a list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | \
+        grep "drop" | grep "$COMMENT" | awk '{print $NF}')
+    for h in $handles; do
+        nft delete rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" handle $h 2>/dev/null || true
+    done
+    echo -e "${GREEN}已删除所有出站拒绝规则，现在所有出站流量将被允许（除非被其他规则阻止）。${NC}"
+    read -p "按回车键继续..."
+}
 
 # ---------- 重置端口计数器 ----------
 reset_port_counters() {
@@ -742,21 +779,25 @@ firewall_menu() {
         echo "4. 修改拒绝端口（增加/删除）"
         echo "5. 一键拒绝所有入站 (自动放行SSH端口)"
         echo "6. 一键拒绝所有出站 (自动放行SSH端口)"
-        echo "7. 重置端口流量计数器"
-        echo "8. 手动设置 SSH 端口"
+        echo "7. 一键允许所有入站 (恢复默认)"
+        echo "8. 一键允许所有出站 (恢复默认)"
+        echo "9. 重置端口流量计数器"
+        echo "10. 手动设置 SSH 端口"
         echo "0. 返回主菜单"
         read -p "请选择 [0-8]: " fw_choice
         case $fw_choice in
-            1) show_firewall ;;
-            2) show_firewall_simple ;;
-            3) modify_accept ;;
-            4) modify_drop ;;
-            5) set_default_drop_in ;;
-            6) set_default_drop_out ;;
-            7) reset_port_counters ;;
-            8) set_ssh_port ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${NC}"; sleep 1 ;;
+             1) show_firewall ;;
+             2) show_firewall_simple ;;
+             3) modify_accept ;;
+             4) modify_drop ;;
+             5) set_default_drop_in ;;
+             6) set_default_drop_out ;;
+             7) set_default_accept_in ;;
+             8) set_default_accept_out ;;
+             9) reset_port_counters ;;
+            10) set_ssh_port ;;
+             0) return ;;
+             *) echo -e "${RED}无效选择${NC}"; sleep 1 ;;
         esac
     done
 }
