@@ -147,12 +147,12 @@ get_current_port_counts() {
                 proto = arr[1]
                 port = arr[2]
                 for (i=1; i<=NF; i++) {
-                    if ($i == "counter") {
-                        bytes = $(i+2)
+                    if ($i == "bytes") {
+                        bytes = $(i+1)
+                        gsub(/[^0-9]/, "", bytes)
                         break
                     }
                 }
-                gsub(/[^0-9]/, "", bytes)
                 print proto":in:"port":"bytes
             }
         }
@@ -164,12 +164,12 @@ get_current_port_counts() {
                 proto = arr[1]
                 port = arr[2]
                 for (i=1; i<=NF; i++) {
-                    if ($i == "counter") {
-                        bytes = $(i+2)
+                    if ($i == "bytes") {
+                        bytes = $(i+1)
+                        gsub(/[^0-9]/, "", bytes)
                         break
                     }
                 }
-                gsub(/[^0-9]/, "", bytes)
                 print proto":in:"port":"bytes
             }
         }
@@ -181,12 +181,12 @@ get_current_port_counts() {
                 proto = arr[1]
                 port = arr[2]
                 for (i=1; i<=NF; i++) {
-                    if ($i == "counter") {
-                        bytes = $(i+2)
+                    if ($i == "bytes") {
+                        bytes = $(i+1)
+                        gsub(/[^0-9]/, "", bytes)
                         break
                     }
                 }
-                gsub(/[^0-9]/, "", bytes)
                 print proto":out:"port":"bytes
             }
         }
@@ -198,12 +198,12 @@ get_current_port_counts() {
                 proto = arr[1]
                 port = arr[2]
                 for (i=1; i<=NF; i++) {
-                    if ($i == "counter") {
-                        bytes = $(i+2)
+                    if ($i == "bytes") {
+                        bytes = $(i+1)
+                        gsub(/[^0-9]/, "", bytes)
                         break
                     }
                 }
-                gsub(/[^0-9]/, "", bytes)
                 print proto":out:"port":"bytes
             }
         }
