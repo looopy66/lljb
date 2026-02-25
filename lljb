@@ -812,6 +812,8 @@ show_active_ports() {
 
 # ---------- 端口流量显示（从 JSON 读取累计值）----------
 show_port_traffic() {
+    echo "Debug: raw counts:" 
+    get_current_port_counts
     clear
     echo -e "${BLUE}--- 监听端口流量使用量 (实时) ---${NC}"
     local ports=($(get_monitored_ports))
