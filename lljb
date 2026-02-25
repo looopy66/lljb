@@ -24,6 +24,7 @@ readonly NFT_FORWARD_CHAIN="forward_filter"           # 转发规则链
 readonly LOG_FILE="/var/log/lljb.log"                 # 日志文件
 readonly TRAFFIC_STATS_FILE="$CONFIG_DIR/traffic_stats.json"  # 流量累计数据文件
 readonly BACKUP_FILE="/tmp/lljb_nft_backup.nft"       # 卸载时备份
+readonly PID_FILE="/var/run/lljb.pid"   # ← 新增这行
 
 # ---------- 辅助函数 ----------
 log() {
@@ -168,26 +169,29 @@ remove_port_counter() {
     log "删除监控端口：$port/$proto"
 }
 
-# ---------- 从 nftables 规则中读取当前计数器值（实时）----------
-get_current_port_counts() {
-    # 输出格式：proto:in:port:bytes  和 proto:out:port:bytes
-    # 从 input 链读取入站
-    nft list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | awk -v table="$NFT_TABLE" -v chain="$NFT_INPUT_CHAIN" '
-        /counter/ && /dport/ && !/comment/ {
-            match($0, /([a-z]+) dport ([0-9]+)/, arr)
-            if (arr[1] && arr[2]) {
-                proto = arr[1]
-                port = arr[2]
-                for (i=1; i<=NF; i++) {
-                    if ($i == "counter") {
-                        bytes = $(i+2)
-                        break
-                    }
-                }
-                gsub(/[^0-9]/, "", bytes)
-                print proto":in:"port":"bytes
-            }
-        }
+# ---------- 从 nftables 读取当前计数器值（更可靠版） ----------
+get_nft_bytes() {
+    local port=$1 proto=$2 direction=$3
+    local chain dir_field fwd_chain bytes=0
+
+    if [ "$direction" = "in" ]; then
+        chain="$NFT_INPUT_CHAIN"
+        dir_field="dport"
+        fwd_chain="$NFT_FORWARD_CHAIN"
+    else
+        chain="$NFT_OUTPUT_CHAIN"
+        dir_field="sport"
+        fwd_chain="$NFT_FORWARD_CHAIN"
+    fi
+
+    # 主链 + forward 链合计
+    for c in "$chain" "$fwd_chain"; do
+        bytes=$(( bytes + $(nft list chain inet "$NFT_TABLE" "$c" 2>/dev/null | \
+            grep -E "$proto $dir_field $port counter" | \
+            grep -o 'bytes [0-9]*' | awk '{print $2}' | head -1 || echo 0) ))
+    done
+    echo "$bytes"
+}
     '
     # 从 forward 链读取入站
     nft list chain inet "$NFT_TABLE" "$NFT_FORWARD_CHAIN" 2>/dev/null | awk -v table="$NFT_TABLE" -v chain="$NFT_FORWARD_CHAIN" '
@@ -958,9 +962,8 @@ modify_drop() {
     esac
 }
 
-# ---------- 守护进程：定期更新 JSON 累计流量 ----------
+# ---------- 守护进程：每分钟更新累计流量（支持跨重启） ----------
 daemon() {
-    # 避免重复启动
     if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
         exit 0
     fi
@@ -968,22 +971,74 @@ daemon() {
     trap 'rm -f "$PID_FILE"; exit' EXIT INT TERM
 
     init_traffic_stats
-    log "守护进程启动"
+    log "守护进程启动（每60秒更新流量）"
 
     while true; do
-        sleep 60  # 每分钟更新一次
+        sleep 60
 
-        # 获取当前实时计数
-        local current=$(get_current_port_counts)
+        local ports=($(get_monitored_ports))
+        [ ${#ports[@]} -eq 0 ] && continue
 
-        # 读取上次累计值（从 JSON 文件）
-        # 这里简化处理：我们直接累加，不记录上次实时值，会导致重复累加。
-        # 正确做法：需要保存上次的实时值，计算增量。但为了简化，我们直接覆盖 JSON 为当前值（丢失历史）。
-        # 为了保留历史，必须实现增量更新。此处先留空，需要时再完善。
+        for port in "${ports[@]}"; do
+            update_port_traffic "$port"
+        done
 
-        # 暂不实现复杂逻辑，确保脚本可运行
-        log "守护进程运行中"
+        log "流量统计已更新"
     done
+}
+
+# 新增：单个端口流量更新（核心修复）
+update_port_traffic() {
+    local port=$1
+
+    # 获取当前实时计数（tcp+udp 合计）
+    local in_tcp=$(get_nft_bytes "$port" tcp in)
+    local in_udp=$(get_nft_bytes "$port" udp in)
+    local out_tcp=$(get_nft_bytes "$port" tcp out)
+    local out_udp=$(get_nft_bytes "$port" udp out)
+
+    local cur_in=$((in_tcp + in_udp))
+    local cur_out=$((out_tcp + out_udp))
+
+    # 读取历史累计 + 上次 nft 值
+    read -r saved_in saved_out last_in last_out < <(get_port_full_stats "$port")
+
+    # 计算增量（防止重启后 nft 从 0 开始导致数据倒退）
+    local delta_in=$((cur_in - last_in))
+    local delta_out=$((cur_out - last_out))
+    [ $delta_in -lt 0 ] && delta_in=0
+    [ $delta_out -lt 0 ] && delta_out=0
+
+    local new_in=$((saved_in + delta_in))
+    local new_out=$((saved_out + delta_out))
+
+    # 更新 JSON
+    jq --arg port "$port" \
+       --argjson in "$new_in" \
+       --argjson out "$new_out" \
+       --argjson li "$cur_in" \
+       --argjson lo "$cur_out" \
+       '.[$port] = {in: $in, out: $out, last_in: $li, last_out: $lo}' \
+       "\( TRAFFIC_STATS_FILE" > " \){TRAFFIC_STATS_FILE}.tmp" && \
+    mv "${TRAFFIC_STATS_FILE}.tmp" "$TRAFFIC_STATS_FILE"
+}
+
+# 新增：读取完整统计
+get_port_full_stats() {
+    local port=$1
+    jq -r --arg p "$port" '
+        .[$p] // {in:0, out:0, last_in:0, last_out:0} |
+        "\(.in) \(.out) \(.last_in) \(.last_out)"
+    ' "$TRAFFIC_STATS_FILE"
+}
+
+# 修改原来的 get_port_stats（兼容新结构）
+get_port_stats() {
+    local port=$1
+    jq -r --arg p "$port" '
+        .[$p] // {in:0, out:0} |
+        "\(.in) \(.out)"
+    ' "$TRAFFIC_STATS_FILE"
 }
 
 # ---------- 卸载脚本 ----------
@@ -1077,6 +1132,10 @@ init() {
     done < "$PORTS_FILE"
 
     # 启动守护进程（后台）
+   #兼容旧 JSON 数据结构
+    jq 'to_entries | map(.value += {last_in: (.value.last_in // 0), last_out: (.value.last_out // 0)}) | from_entries' \
+        "\( TRAFFIC_STATS_FILE" > " \){TRAFFIC_STATS_FILE}.tmp" 2>/dev/null && \
+    mv "${TRAFFIC_STATS_FILE}.tmp" "$TRAFFIC_STATS_FILE" || true
     nohup "$0" --daemon >/dev/null 2>&1 &
 }
 
