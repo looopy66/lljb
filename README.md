@@ -21,13 +21,17 @@ lljb 是一个轻量级的 Linux 端口流量监控与防火墙管理脚本。�
 
 🚀 快速安装
 
-方法一：使用 curl（推荐）
+方法一：使用 curl（推荐）带防火墙版本
 
 ```bash
 curl -sSL -o /usr/local/bin/lljb https://raw.githubusercontent.com/looopy66/lljb/main/lljb && chmod +x /usr/local/bin/lljb && lljb
 ```
+不带防火墙纯监控
+```bash
+curl -sSL -o /usr/local/bin/lljb https://raw.githubusercontent.com/looopy66/lljb/main/clljb && chmod +x /usr/local/bin/lljb && lljb
+```
 
-方法二：使用 wget
+方法二：使用 wget 带防火墙版本
 
 ```bash
 wget -qO /usr/local/bin/lljb https://raw.githubusercontent.com/looopy66/lljb/main/lljb && chmod +x /usr/local/bin/lljb && lljb
