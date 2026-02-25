@@ -104,7 +104,8 @@ install_dependencies() {
 detect_ssh_port() {
     if [ -f "$SSH_PORT_CONFIG" ]; then
         local user_port=$(cat "$SSH_PORT_CONFIG" | tr -d ' \n')
-        if [[ "\( user_port" =\~ ^[0-9]+ \) ]] && [ "$user_port" -ge 1 ] && [ "$user_port" -le 65535 ]; then
+        # 修复：先检查是否纯数字，再用安全的算术判断
+        if [[ "\( user_port" =\~ ^[0-9]+ \) ]] && (( user_port >= 1 && user_port <= 65535 )); then
             echo "$user_port"
             return
         else
