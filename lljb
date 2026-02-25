@@ -614,24 +614,26 @@ show_firewall_simple() {
     clear
     echo -e "${BLUE}--- 防火墙状态 (简洁模式) ---${NC}"
     echo -e "${GREEN}允许入站规则：${NC}"
-    nft list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | \
-        grep -E "tcp dport|udp dport" | grep "accept" | while read -r line; do
+    local rules
+    rules=$(nft list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null)
+    echo "$rules" | grep -E "tcp dport|udp dport" | grep "accept" | while read -r line; do
         if [[ "$line" =~ (tcp|udp)[[:space:]]+dport[[:space:]]+([0-9]+) ]]; then
             proto="${BASH_REMATCH[1]}"
             port="${BASH_REMATCH[2]}"
             printf "%-10s %-10s %s\n" "$port/$proto" "ALLOW" "Anywhere"
         fi
-    done
+    done || true  # 忽略管道失败，避免脚本退出
+
     echo ""
     echo -e "${GREEN}拒绝入站规则：${NC}"
-    nft list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | \
-        grep -E "tcp dport|udp dport" | grep "drop" | while read -r line; do
+    echo "$rules" | grep -E "tcp dport|udp dport" | grep "drop" | while read -r line; do
         if [[ "$line" =~ (tcp|udp)[[:space:]]+dport[[:space:]]+([0-9]+) ]]; then
             proto="${BASH_REMATCH[1]}"
             port="${BASH_REMATCH[2]}"
             printf "%-10s %-10s %s\n" "$port/$proto" "DENY" "Anywhere"
         fi
-    done
+    done || true
+
     echo ""
     read -p "按回车键返回..."
 }
