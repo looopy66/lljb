@@ -353,6 +353,44 @@ add_accept_interactive() {
     read -p "按回车键继续..."
 }
 
+modify_accept() {
+    clear
+    echo -e "${BLUE}--- 修改放行端口 ---${NC}"
+    echo "当前放行规则（包含 ACCEPT）："
+    nft list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | grep "accept" | grep "$COMMENT" || echo "无放行规则"
+    echo ""
+    echo "请选择操作："
+    echo "1. 增加放行端口"
+    echo "2. 删除放行端口"
+    echo "0. 返回"
+    read -p "选择: " op
+    case $op in
+        1) add_accept_interactive ;;
+        2) del_accept_interactive ;;
+        0) return ;;
+        *) echo -e "${RED}无效选择${NC}"; sleep 1 ;;
+    esac
+}
+
+modify_drop() {
+    clear
+    echo -e "${BLUE}--- 修改拒绝端口 ---${NC}"
+    echo "当前拒绝规则（包含 drop）："
+    nft list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | grep "drop" | grep "$COMMENT" || echo "无拒绝规则"
+    echo ""
+    echo "请选择操作："
+    echo "1. 增加拒绝端口"
+    echo "2. 删除拒绝端口"
+    echo "0. 返回"
+    read -p "选择: " op
+    case $op in
+        1) add_drop_interactive ;;
+        2) del_drop_interactive ;;
+        0) return ;;
+        *) echo -e "${RED}无效选择${NC}"; sleep 1 ;;
+    esac
+}
+
 del_accept_interactive() {
     read -p "请输入要删除放行的端口号（可多个，空格分隔）: " -a ports
     if [ ${#ports[@]} -eq 0 ]; then
