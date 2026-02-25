@@ -1,0 +1,922 @@
+#!/bin/bash
+# lljb - 轻量级端口流量监控与防火墙管理工具 (nftables + vnstat 版)
+# 版本：2.0
+# 适用系统：Ubuntu/Debian/Alpine (需支持 nftables 和 vnstat)
+
+set -euo pipefail
+
+# ---------- 颜色输出 ----------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# ---------- 全局配置 ----------
+readonly CONFIG_DIR="/etc/lljb"
+readonly PORTS_FILE="$CONFIG_DIR/ports.conf"          # 监控的端口列表
+readonly SSH_PORT_CONFIG="$CONFIG_DIR/ssh_port.conf" # 手动设置的 SSH 端口
+readonly COMMENT="lljb-managed"                       # nftables 规则注释
+readonly NFT_TABLE="lljb"                             # nftables 表名
+readonly NFT_INPUT_CHAIN="input_filter"               # 入站规则链
+readonly NFT_OUTPUT_CHAIN="output_filter"             # 出站规则链
+readonly LOG_FILE="/var/log/lljb.log"                 # 日志文件
+
+# ---------- 辅助函数 ----------
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+error_exit() {
+    echo -e "${RED}错误：$1${NC}" >&2
+    exit 1
+}
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        error_exit "请以 root 权限运行此脚本。"
+    fi
+}
+
+# ---------- 系统检测与依赖安装 ----------
+detect_system() {
+    if [ -f /etc/alpine-release ]; then
+        echo "alpine"
+    elif [ -f /etc/debian_version ]; then
+        echo "debian"
+    else
+        echo "unknown"
+    fi
+}
+
+install_dependencies() {
+    local missing=()
+    for cmd in nft vnstat bc; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing+=("$cmd")
+        fi
+    done
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    echo -e "${YELLOW}检测到缺少依赖: ${missing[*]}，正在安装...${NC}"
+    local sys=$(detect_system)
+
+    case "$sys" in
+        debian)
+            apt-get update -qq
+            for pkg in "${missing[@]}"; do
+                case "$pkg" in
+                    nft)      apt-get install -y nftables ;;
+                    vnstat)   apt-get install -y vnstat ;;
+                    bc)       apt-get install -y bc ;;
+                esac
+            done
+            # 启动 vnstat 服务
+            systemctl enable vnstat --now 2>/dev/null || service vnstat start 2>/dev/null || true
+            ;;
+        alpine)
+            apk update
+            for pkg in "${missing[@]}"; do
+                case "$pkg" in
+                    nft)      apk add nftables ;;
+                    vnstat)   apk add vnstat ;;
+                    bc)       apk add bc ;;
+                esac
+            done
+            # Alpine 中 vnstat 需要手动初始化数据库（若有接口）
+            rc-update add vnstat default 2>/dev/null || true
+            rc-service vnstat start 2>/dev/null || true
+            ;;
+        *)
+            echo -e "${RED}不支持的系统类型，请手动安装依赖: ${missing[*]}${NC}"
+            exit 1
+            ;;
+    esac
+    echo -e "${GREEN}依赖安装完成${NC}"
+}
+
+# ---------- SSH 端口检测（智能：手动配置 > sshd_config > 监听端口 > 22）----------
+detect_ssh_port() {
+    # 如果用户手动配置文件存在，优先使用
+    if [ -f "$SSH_PORT_CONFIG" ]; then
+        local user_port=$(cat "$SSH_PORT_CONFIG" | tr -d ' \n')
+        if [[ "$user_port" =~ ^[0-9]+$ ]] && [ "$user_port" -ge 1 ] && [ "$user_port" -le 65535 ]; then
+            echo "$user_port"
+            return
+        else
+            log "警告：SSH端口配置文件内容无效，使用自动检测。"
+        fi
+    fi
+
+    # 方法1：从 sshd_config 读取 Port 配置（支持多个Port，取第一个有效值）
+    local config_port=$(grep -E "^Port\s+[0-9]+" /etc/ssh/sshd_config 2>/dev/null | \
+        awk '{print $2}' | head -1)
+    if [ -n "$config_port" ]; then
+        echo "$config_port"
+        return
+    fi
+
+    # 方法2：从运行中的 sshd 进程监听端口检测
+    local listen_port=$(ss -tlnp 2>/dev/null | grep sshd | \
+        grep -oP ':\K\d+' | head -1)
+    if [ -n "$listen_port" ]; then
+        echo "$listen_port"
+        return
+    fi
+
+    # 保底：返回 22
+    echo "22"
+}
+
+# ---------- nftables 初始化 ----------
+init_nftables() {
+    # 创建表（如果不存在）
+    nft add table inet "$NFT_TABLE" 2>/dev/null || true
+    # 创建输入链（挂载到 hook input）
+    nft add chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" { type filter hook input priority 0\; } 2>/dev/null || true
+    # 创建输出链（挂载到 hook output）
+    nft add chain inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" { type filter hook output priority 0\; } 2>/dev/null || true
+}
+
+# ---------- 端口监控计数器操作 ----------
+add_port_counter() {
+    local port=$1
+    local proto=$2
+    local in_counter="lljb_in_${proto}_${port}"
+    local out_counter="lljb_out_${proto}_${port}"
+    # 创建计数器（如果不存在）
+    nft add counter inet "$NFT_TABLE" "$in_counter" 2>/dev/null || true
+    nft add counter inet "$NFT_TABLE" "$out_counter" 2>/dev/null || true
+    # 添加规则：匹配入站流量，使用计数器
+    nft add rule inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" $proto dport $port counter name "$in_counter"
+    # 添加规则：匹配出站流量，使用计数器
+    nft add rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" $proto sport $port counter name "$out_counter"
+    log "添加监控端口：$port/$proto"
+}
+
+remove_port_counter() {
+    local port=$1
+    local proto=$2
+    local in_counter="lljb_in_${proto}_${port}"
+    local out_counter="lljb_out_${proto}_${port}"
+    # 删除计数器（规则会因引用失效，但下次启动时会重新添加）
+    nft delete counter inet "$NFT_TABLE" "$in_counter" 2>/dev/null || true
+    nft delete counter inet "$NFT_TABLE" "$out_counter" 2>/dev/null || true
+    log "删除监控端口：$port/$proto"
+}
+
+get_port_counters() {
+    # 输出格式：proto:in:port:bytes  和 proto:out:port:bytes
+    nft list counters inet "$NFT_TABLE" 2>/dev/null | awk '
+        /counter name lljb_in_/ {
+            split($4, a, "_");
+            proto = a[3];
+            port = a[4];
+            getline; bytes = $4;
+            print proto":in:"port":"bytes
+        }
+        /counter name lljb_out_/ {
+            split($4, a, "_");
+            proto = a[3];
+            port = a[4];
+            getline; bytes = $4;
+            print proto":out:"port":"bytes
+        }
+    '
+}
+
+# ---------- 获取监控端口列表 ----------
+get_monitored_ports() {
+    if [ -f "$PORTS_FILE" ]; then
+        cat "$PORTS_FILE"
+    fi
+}
+
+# ---------- 字节数格式化 ----------
+format_bytes() {
+    local bytes=$1
+    if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
+        bytes=0
+    fi
+    if [ $bytes -ge 1073741824 ]; then
+        echo "$(echo "scale=2; $bytes/1073741824" | bc 2>/dev/null || echo "0.00")GB"
+    elif [ $bytes -ge 1048576 ]; then
+        echo "$(echo "scale=2; $bytes/1048576" | bc 2>/dev/null || echo "0.00")MB"
+    elif [ $bytes -ge 1024 ]; then
+        echo "$(echo "scale=2; $bytes/1024" | bc 2>/dev/null || echo "0.00")KB"
+    else
+        echo "${bytes}B"
+    fi
+}
+
+# ---------- 菜单：显示端口流量 ----------
+show_port_traffic() {
+    clear
+    echo -e "${BLUE}--- 监听端口流量使用量 (累计) ---${NC}"
+    local counters=$(get_port_counters)
+    if [ -z "$counters" ]; then
+        echo "暂无流量数据。"
+    else
+        printf "%-10s %-8s %-15s %-15s\n" "端口" "协议" "下载(入站)" "上传(出站)"
+        echo "----------------------------------------"
+        declare -A in_map out_map
+        while IFS=: read -r proto dir port bytes; do
+            if [ "$dir" = "in" ]; then
+                in_map["$port:$proto"]=$bytes
+            else
+                out_map["$port:$proto"]=$bytes
+            fi
+        done <<< "$counters"
+        monitored=$(get_monitored_ports)
+        for entry in $monitored; do
+            port=$entry
+            for proto in tcp udp; do
+                in_bytes=${in_map["$port:$proto"]:-0}
+                out_bytes=${out_map["$port:$proto"]:-0}
+                if [ $in_bytes -gt 0 ] || [ $out_bytes -gt 0 ]; then
+                    printf "%-10s %-8s %-15s %-15s\n" "$port" "$proto" "$(format_bytes $in_bytes)" "$(format_bytes $out_bytes)"
+                fi
+            done
+        done
+    fi
+    echo ""
+    read -p "按回车键返回菜单..."
+}
+
+# ---------- 菜单：显示总流量（vnstat）----------
+show_total_traffic() {
+    clear
+    echo -e "${BLUE}--- 主机总流量使用量 (当日累计) ---${NC}"
+    if command -v vnstat >/dev/null 2>&1; then
+        # 获取当天数据，并检查是否成功
+        local out
+        out=$(vnstat -d --oneline 2>/dev/null | head -1)
+        if [ -n "$out" ]; then
+            # 按分号分割，确保字段数足够
+            IFS=';' read -r iface date in_val in_unit out_val out_unit rest <<< "$out"
+            if [ -n "$in_val" ] && [ -n "$out_val" ]; then
+                echo "总下载(入站): $in_val $in_unit"
+                echo "总上传(出站): $out_val $out_unit"
+            else
+                echo "vnstat 数据格式异常，请检查数据库。"
+            fi
+        else
+            echo "vnstat 尚未收集到数据，请稍后再试。"
+        fi
+    else
+        echo "vnstat 未安装，无法显示流量。"
+    fi
+    echo ""
+    read -p "按回车键返回菜单..."
+}
+
+# ---------- 菜单：增加监听端口 ----------
+add_port() {
+    clear
+    echo -e "${BLUE}--- 增加监听端口 ---${NC}"
+    read -p "请输入要监控的端口号（可多个，用空格分隔）: " -a ports
+    if [ ${#ports[@]} -eq 0 ]; then
+        echo -e "${RED}未输入端口${NC}"
+        sleep 1
+        return
+    fi
+    for port in "${ports[@]}"; do
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            echo -e "${RED}跳过无效端口: $port${NC}"
+            continue
+        fi
+        if grep -qx "$port" "$PORTS_FILE" 2>/dev/null; then
+            echo -e "${YELLOW}端口 $port 已在监控列表中${NC}"
+            continue
+        fi
+        echo "$port" >> "$PORTS_FILE"
+        add_port_counter "$port" tcp
+        add_port_counter "$port" udp
+        echo -e "${GREEN}端口 $port 已添加监控${NC}"
+    done
+    echo ""
+    read -p "按回车键返回菜单..."
+}
+
+# ---------- 菜单：删除监听端口 ----------
+remove_port() {
+    clear
+    echo -e "${BLUE}--- 删除监听端口 ---${NC}"
+    monitored=$(get_monitored_ports)
+    if [ -z "$monitored" ]; then
+        echo "当前没有监控任何端口。"
+    else
+        echo "当前监控端口:"
+        echo "$monitored" | nl
+        read -p "请输入要删除的端口号（可多个，用空格分隔）: " -a ports
+        for port in "${ports[@]}"; do
+            if grep -qx "$port" "$PORTS_FILE"; then
+                sed -i "/^$port$/d" "$PORTS_FILE"
+                remove_port_counter "$port" tcp
+                remove_port_counter "$port" udp
+                echo -e "${GREEN}端口 $port 已删除${NC}"
+            else
+                echo -e "${YELLOW}端口 $port 不在监控列表中${NC}"
+            fi
+        done
+    fi
+    echo ""
+    read -p "按回车键返回菜单..."
+}
+
+# ---------- 防火墙管理辅助函数 ----------
+add_accept_rule() {
+    local port=$1
+    local proto=$2
+    local direction=$3   # in / out / both
+    case $direction in
+        in)
+            nft add rule inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" $proto dport $port accept comment \"$COMMENT\"
+            log "添加放行规则（入站）：$port/$proto"
+            ;;
+        out)
+            nft add rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" $proto sport $port accept comment \"$COMMENT\"
+            log "添加放行规则（出站）：$port/$proto"
+            ;;
+        both)
+            nft add rule inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" $proto dport $port accept comment \"$COMMENT\"
+            nft add rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" $proto sport $port accept comment \"$COMMENT\"
+            log "添加放行规则（双向）：$port/$proto"
+            ;;
+    esac
+}
+
+del_accept_rule() {
+    local port=$1
+    local proto=$2
+    local direction=$3
+    case $direction in
+        in)
+            local handle=$(nft -a list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | \
+                grep "$proto dport $port accept" | grep "$COMMENT" | awk '{print $NF}')
+            [ -n "$handle" ] && nft delete rule inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" handle $handle && \
+                log "删除放行规则（入站）：$port/$proto"
+            ;;
+        out)
+            local handle=$(nft -a list chain inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" 2>/dev/null | \
+                grep "$proto sport $port accept" | grep "$COMMENT" | awk '{print $NF}')
+            [ -n "$handle" ] && nft delete rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" handle $handle && \
+                log "删除放行规则（出站）：$port/$proto"
+            ;;
+        both)
+            local in_handle=$(nft -a list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | \
+                grep "$proto dport $port accept" | grep "$COMMENT" | awk '{print $NF}')
+            [ -n "$in_handle" ] && nft delete rule inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" handle $in_handle
+            local out_handle=$(nft -a list chain inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" 2>/dev/null | \
+                grep "$proto sport $port accept" | grep "$COMMENT" | awk '{print $NF}')
+            [ -n "$out_handle" ] && nft delete rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" handle $out_handle
+            log "删除放行规则（双向）：$port/$proto"
+            ;;
+    esac
+}
+
+add_drop_rule() {
+    local port=$1
+    local proto=$2
+    local direction=$3
+    case $direction in
+        in)
+            nft add rule inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" $proto dport $port drop comment \"$COMMENT\"
+            log "添加拒绝规则（入站）：$port/$proto"
+            ;;
+        out)
+            nft add rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" $proto sport $port drop comment \"$COMMENT\"
+            log "添加拒绝规则（出站）：$port/$proto"
+            ;;
+        both)
+            nft add rule inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" $proto dport $port drop comment \"$COMMENT\"
+            nft add rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" $proto sport $port drop comment \"$COMMENT\"
+            log "添加拒绝规则（双向）：$port/$proto"
+            ;;
+    esac
+}
+
+del_drop_rule() {
+    local port=$1
+    local proto=$2
+    local direction=$3
+    case $direction in
+        in)
+            local handle=$(nft -a list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | \
+                grep "$proto dport $port drop" | grep "$COMMENT" | awk '{print $NF}')
+            [ -n "$handle" ] && nft delete rule inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" handle $handle && \
+                log "删除拒绝规则（入站）：$port/$proto"
+            ;;
+        out)
+            local handle=$(nft -a list chain inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" 2>/dev/null | \
+                grep "$proto sport $port drop" | grep "$COMMENT" | awk '{print $NF}')
+            [ -n "$handle" ] && nft delete rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" handle $handle && \
+                log "删除拒绝规则（出站）：$port/$proto"
+            ;;
+        both)
+            local in_handle=$(nft -a list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | \
+                grep "$proto dport $port drop" | grep "$COMMENT" | awk '{print $NF}')
+            [ -n "$in_handle" ] && nft delete rule inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" handle $in_handle
+            local out_handle=$(nft -a list chain inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" 2>/dev/null | \
+                grep "$proto sport $port drop" | grep "$COMMENT" | awk '{print $NF}')
+            [ -n "$out_handle" ] && nft delete rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" handle $out_handle
+            log "删除拒绝规则（双向）：$port/$proto"
+            ;;
+    esac
+}
+
+# ---------- 防火墙子菜单交互 ----------
+modify_accept() {
+    clear
+    echo -e "${BLUE}--- 修改放行端口 ---${NC}"
+    echo "当前放行规则（包含 ACCEPT）："
+    nft list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | grep "accept" | grep "$COMMENT" || echo "无放行规则"
+    echo ""
+    echo "请选择操作："
+    echo "1. 增加放行端口"
+    echo "2. 删除放行端口"
+    echo "0. 返回"
+    read -p "选择: " op
+    case $op in
+        1) add_accept_interactive ;;
+        2) del_accept_interactive ;;
+        0) return ;;
+        *) echo -e "${RED}无效选择${NC}"; sleep 1 ;;
+    esac
+}
+
+add_accept_interactive() {
+    read -p "请输入要放行的端口号（可多个，空格分隔）: " -a ports
+    if [ ${#ports[@]} -eq 0 ]; then
+        echo -e "${RED}未输入端口${NC}"
+        read -p "按回车键继续..."
+        return
+    fi
+    echo "请选择方向："
+    echo "1) 入站 (in)"
+    echo "2) 出站 (out)"
+    echo "3) 双向 (both)"
+    read -p "选择 [1-3] (默认 3): " dir_choice
+    dir_choice=${dir_choice:-3}
+    case $dir_choice in
+        1) direction="in" ;;
+        2) direction="out" ;;
+        3) direction="both" ;;
+        *) echo -e "${RED}无效选择，默认使用双向${NC}"; direction="both" ;;
+    esac
+
+    echo "请选择协议："
+    echo "1) TCP only"
+    echo "2) UDP only"
+    echo "3) TCP+UDP (both)"
+    read -p "选择 [1-3] (默认 3): " proto_choice
+    proto_choice=${proto_choice:-3}
+    case $proto_choice in
+        1) protos=("tcp") ;;
+        2) protos=("udp") ;;
+        3) protos=("tcp" "udp") ;;
+        *) echo -e "${RED}无效选择，默认使用 TCP+UDP${NC}"; protos=("tcp" "udp") ;;
+    esac
+
+    for port in "${ports[@]}"; do
+        if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}跳过无效端口 $port${NC}"
+            continue
+        fi
+        for proto in "${protos[@]}"; do
+            add_accept_rule "$port" "$proto" "$direction"
+            echo -e "${GREEN}已添加放行规则 $port/$proto (${direction})${NC}"
+        done
+    done
+    # 确保 SSH 端口入站放行（无论用户选择什么方向）
+    add_accept_rule "$SSH_PORT" "tcp" "in" 2>/dev/null || true
+    echo -e "${GREEN}已确保 SSH 端口 $SSH_PORT/tcp 入站放行${NC}"
+    read -p "按回车键继续..."
+}
+
+del_accept_interactive() {
+    read -p "请输入要删除放行的端口号（可多个，空格分隔）: " -a ports
+    if [ ${#ports[@]} -eq 0 ]; then
+        echo -e "${RED}未输入端口${NC}"
+        read -p "按回车键继续..."
+        return
+    fi
+    echo "请选择要删除的方向："
+    echo "1) 入站 (in)"
+    echo "2) 出站 (out)"
+    echo "3) 双向 (both)"
+    read -p "选择 [1-3] (默认 3): " dir_choice
+    dir_choice=${dir_choice:-3}
+    case $dir_choice in
+        1) direction="in" ;;
+        2) direction="out" ;;
+        3) direction="both" ;;
+        *) echo -e "${RED}无效选择，默认使用双向${NC}"; direction="both" ;;
+    esac
+
+    echo "请选择协议："
+    echo "1) TCP only"
+    echo "2) UDP only"
+    echo "3) TCP+UDP (both)"
+    read -p "选择 [1-3] (默认 3): " proto_choice
+    proto_choice=${proto_choice:-3}
+    case $proto_choice in
+        1) protos=("tcp") ;;
+        2) protos=("udp") ;;
+        3) protos=("tcp" "udp") ;;
+        *) echo -e "${RED}无效选择，默认使用 TCP+UDP${NC}"; protos=("tcp" "udp") ;;
+    esac
+
+    for port in "${ports[@]}"; do
+        if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}跳过无效端口 $port${NC}"
+            continue
+        fi
+        # 如果用户试图删除 SSH 端口的入站规则，则阻止
+        if [ "$port" = "$SSH_PORT" ] && { [ "$direction" = "in" ] || [ "$direction" = "both" ]; }; then
+            echo -e "${YELLOW}警告：不能删除 SSH 端口 $SSH_PORT 的入站放行规则，已自动跳过。${NC}"
+            # 如果 direction 是 both，可以尝试删除出站部分
+            if [ "$direction" = "both" ]; then
+                # 单独处理出站
+                for proto in "${protos[@]}"; do
+                    del_accept_rule "$port" "$proto" "out"
+                    echo -e "${GREEN}已删除放行规则 $port/$proto (out)${NC}"
+                done
+            fi
+        else
+            for proto in "${protos[@]}"; do
+                del_accept_rule "$port" "$proto" "$direction"
+                echo -e "${GREEN}已删除放行规则 $port/$proto (${direction})${NC}"
+            done
+        fi
+    done
+    read -p "按回车键继续..."
+}
+
+modify_drop() {
+    clear
+    echo -e "${BLUE}--- 修改拒绝端口 ---${NC}"
+    echo "当前拒绝规则（包含 drop）："
+    nft list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | grep "drop" | grep "$COMMENT" || echo "无拒绝规则"
+    echo ""
+    echo "请选择操作："
+    echo "1. 增加拒绝端口"
+    echo "2. 删除拒绝端口"
+    echo "0. 返回"
+    read -p "选择: " op
+    case $op in
+        1) add_drop_interactive ;;
+        2) del_drop_interactive ;;
+        0) return ;;
+        *) echo -e "${RED}无效选择${NC}"; sleep 1 ;;
+    esac
+}
+
+add_drop_interactive() {
+    read -p "请输入要拒绝的端口号（可多个，空格分隔）: " -a ports
+    if [ ${#ports[@]} -eq 0 ]; then
+        echo -e "${RED}未输入端口${NC}"
+        read -p "按回车键继续..."
+        return
+    fi
+    echo "请选择方向："
+    echo "1) 入站 (in)"
+    echo "2) 出站 (out)"
+    echo "3) 双向 (both)"
+    read -p "选择 [1-3] (默认 3): " dir_choice
+    dir_choice=${dir_choice:-3}
+    case $dir_choice in
+        1) direction="in" ;;
+        2) direction="out" ;;
+        3) direction="both" ;;
+        *) echo -e "${RED}无效选择，默认使用双向${NC}"; direction="both" ;;
+    esac
+
+    echo "请选择协议："
+    echo "1) TCP only"
+    echo "2) UDP only"
+    echo "3) TCP+UDP (both)"
+    read -p "选择 [1-3] (默认 3): " proto_choice
+    proto_choice=${proto_choice:-3}
+    case $proto_choice in
+        1) protos=("tcp") ;;
+        2) protos=("udp") ;;
+        3) protos=("tcp" "udp") ;;
+        *) echo -e "${RED}无效选择，默认使用 TCP+UDP${NC}"; protos=("tcp" "udp") ;;
+    esac
+
+    for port in "${ports[@]}"; do
+        if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}跳过无效端口 $port${NC}"
+            continue
+        fi
+        # 禁止拒绝 SSH 端口（任何方向）
+        if [ "$port" = "$SSH_PORT" ]; then
+            echo -e "${RED}错误：不能拒绝 SSH 端口 $SSH_PORT，操作已跳过。${NC}"
+            continue
+        fi
+        for proto in "${protos[@]}"; do
+            add_drop_rule "$port" "$proto" "$direction"
+            echo -e "${GREEN}已添加拒绝规则 $port/$proto (${direction})${NC}"
+        done
+    done
+    read -p "按回车键继续..."
+}
+
+del_drop_interactive() {
+    read -p "请输入要删除拒绝的端口号（可多个，空格分隔）: " -a ports
+    if [ ${#ports[@]} -eq 0 ]; then
+        echo -e "${RED}未输入端口${NC}"
+        read -p "按回车键继续..."
+        return
+    fi
+    echo "请选择要删除的方向："
+    echo "1) 入站 (in)"
+    echo "2) 出站 (out)"
+    echo "3) 双向 (both)"
+    read -p "选择 [1-3] (默认 3): " dir_choice
+    dir_choice=${dir_choice:-3}
+    case $dir_choice in
+        1) direction="in" ;;
+        2) direction="out" ;;
+        3) direction="both" ;;
+        *) echo -e "${RED}无效选择，默认使用双向${NC}"; direction="both" ;;
+    esac
+
+    echo "请选择协议："
+    echo "1) TCP only"
+    echo "2) UDP only"
+    echo "3) TCP+UDP (both)"
+    read -p "选择 [1-3] (默认 3): " proto_choice
+    proto_choice=${proto_choice:-3}
+    case $proto_choice in
+        1) protos=("tcp") ;;
+        2) protos=("udp") ;;
+        3) protos=("tcp" "udp") ;;
+        *) echo -e "${RED}无效选择，默认使用 TCP+UDP${NC}"; protos=("tcp" "udp") ;;
+    esac
+
+    for port in "${ports[@]}"; do
+        if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}跳过无效端口 $port${NC}"
+            continue
+        fi
+        # 删除拒绝规则无需特殊保护，直接操作
+        for proto in "${protos[@]}"; do
+            del_drop_rule "$port" "$proto" "$direction"
+            echo -e "${GREEN}已删除拒绝规则 $port/$proto (${direction})${NC}"
+        done
+    done
+    read -p "按回车键继续..."
+}
+
+set_default_drop_in() {
+    clear
+    echo -e "${YELLOW}警告：即将设置 INPUT 链默认策略为 DROP，所有入站连接将被拒绝，但会自动放行 SSH 端口。${NC}"
+    read -p "确认继续？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        return
+    fi
+
+    echo -e "${GREEN}1. 确保 SSH 端口 $SSH_PORT 已放行...${NC}"
+    add_accept_rule "$SSH_PORT" "tcp" 2>/dev/null || true
+    echo -e "${GREEN}2. 在链末尾添加 DROP 规则作为默认策略...${NC}"
+    # 删除可能存在的旧 drop 规则
+    local handles=$(nft -a list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | \
+        grep "drop" | grep -v "dport" | awk '{print $NF}')
+    for h in $handles; do
+        nft delete rule inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" handle $h 2>/dev/null || true
+    done
+    # 添加 drop 规则
+    nft add rule inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" drop
+    echo -e "${GREEN}操作完成。${NC}"
+    read -p "按回车键继续..."
+}
+
+set_default_drop_out() {
+    clear
+    echo -e "${YELLOW}警告：即将设置 OUTPUT 链默认策略为 DROP，所有出站连接将被拒绝，但会自动放行必要的连接以维持 SSH 会话。${NC}"
+    read -p "确认继续？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        return
+    fi
+
+    echo -e "${GREEN}1. 放行已建立连接、回环接口、SSH 出站...${NC}"
+    # 删除可能存在的旧 drop 规则
+    local handles=$(nft -a list chain inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" 2>/dev/null | \
+        grep "drop" | grep -v "dport" | awk '{print $NF}')
+    for h in $handles; do
+        nft delete rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" handle $h 2>/dev/null || true
+    done
+    # 添加必要的放行规则
+    nft add rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" ct state established,related accept comment \"$COMMENT\"
+    nft add rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" oif lo accept comment \"$COMMENT\"
+    nft add rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" tcp dport $SSH_PORT accept comment \"$COMMENT\"
+    # 添加 drop 规则
+    nft add rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" drop
+    echo -e "${GREEN}操作完成。${NC}"
+    read -p "按回车键继续..."
+}
+
+# ---------- 重置端口计数器 ----------
+reset_port_counters() {
+    clear
+    echo -e "${BLUE}--- 重置端口流量计数器 ---${NC}"
+    local ports=($(get_monitored_ports))
+    if [ ${#ports[@]} -eq 0 ]; then
+        echo "当前没有监控任何端口。"
+    else
+        echo "将重置以下端口的流量累计值："
+        printf "%s " "${ports[@]}"
+        echo ""
+        read -p "确认重置？[y/N]: " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            for port in "${ports[@]}"; do
+                remove_port_counter "$port" tcp
+                remove_port_counter "$port" udp
+                add_port_counter "$port" tcp
+                add_port_counter "$port" udp
+                echo -e "${GREEN}端口 $port 计数器已重置${NC}"
+            done
+            echo -e "${GREEN}所有监控端口计数器已清零。${NC}"
+        else
+            echo "取消重置。"
+        fi
+    fi
+    read -p "按回车键返回..."
+}
+
+# ---------- 手动设置 SSH 端口 ----------
+set_ssh_port() {
+    clear
+    echo -e "${BLUE}--- 手动设置 SSH 端口 ---${NC}"
+    echo "当前 SSH 端口: $SSH_PORT"
+    echo "你可以输入新的端口号（1-65535），输入空值取消。"
+    read -p "新端口: " new_port
+    if [ -z "$new_port" ]; then
+        echo "取消设置。"
+    elif ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+        echo -e "${RED}无效端口号。${NC}"
+    else
+        echo "$new_port" > "$SSH_PORT_CONFIG"
+        # 重新检测并更新 SSH_PORT 变量
+        SSH_PORT=$(detect_ssh_port)
+        echo -e "${GREEN}SSH 端口已设置为 $SSH_PORT${NC}"
+        # 立即放行新端口
+        add_accept_rule "$SSH_PORT" "tcp" 2>/dev/null || true
+    fi
+    read -p "按回车键继续..."
+}
+
+# ---------- 显示防火墙规则（详细）----------
+show_firewall() {
+    clear
+    echo -e "${BLUE}--- 当前 nftables 规则 ---${NC}"
+    nft list ruleset
+    echo ""
+    read -p "按回车键返回..."
+}
+
+# ---------- 显示防火墙规则（简洁类似 ufw）----------
+show_firewall_simple() {
+    clear
+    echo -e "${BLUE}--- 防火墙状态 (简洁模式) ---${NC}"
+    echo -e "${GREEN}允许入站规则：${NC}"
+    nft list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | \
+        grep -E "tcp dport|udp dport" | grep "accept" | while read -r line; do
+        if [[ "$line" =~ (tcp|udp)[[:space:]]+dport[[:space:]]+([0-9]+) ]]; then
+            proto="${BASH_REMATCH[1]}"
+            port="${BASH_REMATCH[2]}"
+            printf "%-10s %-10s %s\n" "$port/$proto" "ALLOW" "Anywhere"
+        fi
+    done
+    echo ""
+    echo -e "${GREEN}拒绝入站规则：${NC}"
+    nft list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | \
+        grep -E "tcp dport|udp dport" | grep "drop" | while read -r line; do
+        if [[ "$line" =~ (tcp|udp)[[:space:]]+dport[[:space:]]+([0-9]+) ]]; then
+            proto="${BASH_REMATCH[1]}"
+            port="${BASH_REMATCH[2]}"
+            printf "%-10s %-10s %s\n" "$port/$proto" "DENY" "Anywhere"
+        fi
+    done
+    echo ""
+    read -p "按回车键返回..."
+}
+
+# ---------- 防火墙子菜单 ----------
+firewall_menu() {
+    while true; do
+        clear
+        echo -e "${BLUE}--- 防火墙配置 (nftables) ---${NC}"
+        echo "1. 显示当前防火墙规则 (详细模式)"
+        echo "2. 显示当前防火墙规则 (简洁模式)"
+        echo "3. 修改放行端口（增加/删除）"
+        echo "4. 修改拒绝端口（增加/删除）"
+        echo "5. 一键拒绝所有入站 (自动放行SSH端口)"
+        echo "6. 一键拒绝所有出站 (自动放行SSH端口)"
+        echo "7. 重置端口流量计数器"
+        echo "8. 手动设置 SSH 端口"
+        echo "0. 返回主菜单"
+        read -p "请选择 [0-8]: " fw_choice
+        case $fw_choice in
+            1) show_firewall ;;
+            2) show_firewall_simple ;;
+            3) modify_accept ;;
+            4) modify_drop ;;
+            5) set_default_drop_in ;;
+            6) set_default_drop_out ;;
+            7) reset_port_counters ;;
+            8) set_ssh_port ;;
+            0) return ;;
+            *) echo -e "${RED}无效选择${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ---------- 卸载脚本 ----------
+uninstall_script() {
+    clear
+    echo -e "${RED}警告：此操作将彻底卸载 lljb，并删除所有 nftables 规则和配置文件。${NC}"
+    read -p "确认卸载？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        return
+    fi
+    # 删除 nftables 表
+    nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+    # 删除配置文件
+    rm -rf "$CONFIG_DIR"
+    # 删除自身
+    rm -f "$0"
+    echo -e "${GREEN}卸载完成。${NC}"
+    exit 0
+}
+
+# ---------- 主菜单 ----------
+main_menu() {
+    while true; do
+        clear
+        echo -e "${BLUE}=================================${NC}"
+        echo -e "${GREEN}       l l j b   主菜单${NC}"
+        echo -e "${BLUE}=================================${NC}"
+        monitored=$(get_monitored_ports | tr '\n' ' ')
+        if [ -n "$monitored" ]; then
+            echo -e "${YELLOW}当前监控端口:${NC} $monitored"
+        else
+            echo -e "${YELLOW}当前监控端口:${NC} 无"
+        fi
+        echo -e "${GREEN}SSH 端口:${NC} $SSH_PORT"
+        echo ""
+        echo "1. 显示监听端口流量使用量"
+        echo "2. 显示总流量使用量 (vnstat)"
+        echo "3. 增加监听端口"
+        echo "4. 删除监听端口"
+        echo "5. 彻底卸载脚本"
+        echo "6. 配置防火墙"
+        echo "0. 退出"
+        echo -e "${BLUE}=================================${NC}"
+        read -p "请选择 [0-6]: " choice
+        case $choice in
+            1) show_port_traffic ;;
+            2) show_total_traffic ;;
+            3) add_port ;;
+            4) remove_port ;;
+            5) uninstall_script ;;
+            6) firewall_menu ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择，请重试${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ---------- 初始化 ----------
+init() {
+    mkdir -p "$CONFIG_DIR"
+    touch "$PORTS_FILE" "$LOG_FILE"
+    init_nftables
+
+    # 检测 SSH 端口
+    SSH_PORT=$(detect_ssh_port)
+    echo -e "${GREEN}检测到 SSH 端口: $SSH_PORT${NC}"
+
+    # 确保 SSH 端口被放行
+    add_accept_rule "$SSH_PORT" "tcp" 2>/dev/null || true
+
+    # 从配置文件加载已有端口，并确保计数器存在
+    while read -r port; do
+        [ -z "$port" ] && continue
+        add_port_counter "$port" tcp 2>/dev/null || true
+        add_port_counter "$port" udp 2>/dev/null || true
+    done < "$PORTS_FILE"
+}
+
+# ---------- 主入口 ----------
+main() {
+    check_root
+    install_dependencies
+    init
+    main_menu
+}
+
+main "$@"
