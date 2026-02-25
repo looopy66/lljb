@@ -7,7 +7,6 @@ export PATH=$PATH:/sbin:/usr/sbin
 set -euo pipefail
 
 # ---------- 全局配置 ----------
-readonly TOTAL_FILE="$CONFIG_DIR/total.db"
 readonly SCRIPT_NAME="lljb"
 readonly CONFIG_DIR="/etc/lljb"
 readonly PORTS_FILE="$CONFIG_DIR/ports.conf"
@@ -16,7 +15,8 @@ readonly LAST_COUNTER_FILE="$CONFIG_DIR/last_counter"
 readonly PID_FILE="/var/run/lljb.pid"
 readonly LOG_FILE="/var/log/lljb.log"
 readonly COMMENT="lljb-managed"
-readonly DAEMON_INTERVAL=30  # 轮询间隔（秒）
+readonly DAEMON_INTERVAL=30
+readonly TOTAL_FILE="$CONFIG_DIR/total.db"   # 如果已添加总流量功能
 
 # ---------- 颜色输出 ----------
 RED='\033[0;31m'
