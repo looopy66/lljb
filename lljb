@@ -187,12 +187,15 @@ get_raw_counters() {
 # 字节数格式化
 format_bytes() {
     local bytes=$1
+    if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
+        bytes=0
+    fi
     if [ $bytes -ge 1073741824 ]; then
-        echo "$(echo "scale=2; $bytes/1073741824" | bc)GB"
+        echo "$(echo "scale=2; $bytes/1073741824" | bc 2>/dev/null || echo "0.00")GB"
     elif [ $bytes -ge 1048576 ]; then
-        echo "$(echo "scale=2; $bytes/1048576" | bc)MB"
+        echo "$(echo "scale=2; $bytes/1048576" | bc 2>/dev/null || echo "0.00")MB"
     elif [ $bytes -ge 1024 ]; then
-        echo "$(echo "scale=2; $bytes/1024" | bc)KB"
+        echo "$(echo "scale=2; $bytes/1024" | bc 2>/dev/null || echo "0.00")KB"
     else
         echo "${bytes}B"
     fi
@@ -464,15 +467,19 @@ show_port_traffic() {
 show_total_traffic() {
     clear
     echo -e "${BLUE}--- 主机总流量使用量 (当日累计) ---${NC}"
-    if [ -f "$TOTAL_FILE" ]; then
-        read -r total_in total_out < "$TOTAL_FILE"
-        total=$((total_in + total_out))
-        echo "总下载(入站): $(format_bytes $total_in)"
-        echo "总上传(出站): $(format_bytes $total_out)"
-        echo "总计: $(format_bytes $total)"
-    else
-        echo "暂无数据，请稍后重试。"
+    local total_in=0
+    local total_out=0
+    if [ -f "$TOTAL_FILE" ] && [ -s "$TOTAL_FILE" ]; then
+        # 读取前两个数字，忽略可能的其他字段（如 last_raw）
+        read -r total_in total_out _ < "$TOTAL_FILE" 2>/dev/null || true
+        # 确保变量为数字
+        total_in=${total_in:-0}
+        total_out=${total_out:-0}
     fi
+    local total=$((total_in + total_out))
+    echo "总下载(入站): $(format_bytes $total_in)"
+    echo "总上传(出站): $(format_bytes $total_out)"
+    echo "总计: $(format_bytes $total)"
     echo ""
     read -p "按回车键返回菜单..."
 }
