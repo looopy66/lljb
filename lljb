@@ -244,62 +244,6 @@ get_current_port_counts() {
         }
     '
 }
-    '
-    # 从 forward 链读取入站
-    nft list chain inet "$NFT_TABLE" "$NFT_FORWARD_CHAIN" 2>/dev/null | awk -v table="$NFT_TABLE" -v chain="$NFT_FORWARD_CHAIN" '
-        /counter/ && /dport/ && && /lljb-managed/ {
-            match($0, /([a-z]+) dport ([0-9]+)/, arr)
-            if (arr[1] && arr[2]) {
-                proto = arr[1]
-                port = arr[2]
-                for (i=1; i<=NF; i++) {
-                    if ($i == "counter") {
-                        bytes = $(i+2)
-                        break
-                    }
-                }
-                gsub(/[^0-9]/, "", bytes)
-                print proto":in:"port":"bytes
-            }
-        }
-    '
-    # 从 output 链读取出站
-    nft list chain inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" 2>/dev/null | awk -v table="$NFT_TABLE" -v chain="$NFT_OUTPUT_CHAIN" '
-        /counter/ && /sport/ && && /lljb-managed/ {
-            match($0, /([a-z]+) sport ([0-9]+)/, arr)
-            if (arr[1] && arr[2]) {
-                proto = arr[1]
-                port = arr[2]
-                for (i=1; i<=NF; i++) {
-                    if ($i == "counter") {
-                        bytes = $(i+2)
-                        break
-                    }
-                }
-                gsub(/[^0-9]/, "", bytes)
-                print proto":out:"port":"bytes
-            }
-        }
-    '
-    # 从 forward 链读取发往其他主机的出站（sport）
-    nft list chain inet "$NFT_TABLE" "$NFT_FORWARD_CHAIN" 2>/dev/null | awk -v table="$NFT_TABLE" -v chain="$NFT_FORWARD_CHAIN" '
-        /counter/ && /sport/ && && /lljb-managed/ {
-            match($0, /([a-z]+) sport ([0-9]+)/, arr)
-            if (arr[1] && arr[2]) {
-                proto = arr[1]
-                port = arr[2]
-                for (i=1; i<=NF; i++) {
-                    if ($i == "counter") {
-                        bytes = $(i+2)
-                        break
-                    }
-                }
-                gsub(/[^0-9]/, "", bytes)
-                print proto":out:"port":"bytes
-            }
-        }
-    '
-}
 
 # ---------- JSON 流量持久化 ----------
 init_traffic_stats() {
