@@ -1,4 +1,5 @@
 #!/bin/bash
+export PATH=$PATH:/sbin:/usr/sbin
 # lljb - 轻量级端口流量监控与防火墙管理工具
 # 版本：1.1 (新增一键拒绝入站/出站功能)
 # 作者：looopy66
@@ -62,7 +63,7 @@ create_custom_chains() {
         iptables -I OUTPUT -j TRAFFIC_OUT
     fi
 
-    # IPv6 (仅当系统支持 IPv6 且 ip6tables 可用时)
+    # IPv6 (如果 ip6tables 可用)
     if command -v ip6tables >/dev/null 2>&1; then
         if ! ip6tables -L TRAFFIC_IN >/dev/null 2>&1; then
             ip6tables -N TRAFFIC_IN
@@ -104,24 +105,24 @@ add_monitor_rule() {
     iptables -A TRAFFIC_OUT -p $proto --sport $port -m comment --comment "$COMMENT"
     # IPv6
     if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -A TRAFFIC_IN -p $proto --dport $port -m comment --comment "$COMMENT" 2>/dev/null
-        ip6tables -A TRAFFIC_OUT -p $proto --sport $port -m comment --comment "$COMMENT" 2>/dev/null
+        ip6tables -A TRAFFIC_IN -p $proto --dport $port -m comment --comment "$COMMENT"
+        ip6tables -A TRAFFIC_OUT -p $proto --sport $port -m comment --comment "$COMMENT"
     fi
     log "添加监控端口：$port/$proto (IPv4+IPv6)"
 }
 
-remove_monitor_rule() {
+add_monitor_rule() {
     local port=$1
     local proto=$2
     # IPv4
-    iptables -D TRAFFIC_IN -p $proto --dport $port -m comment --comment "$COMMENT" 2>/dev/null || true
-    iptables -D TRAFFIC_OUT -p $proto --sport $port -m comment --comment "$COMMENT" 2>/dev/null || true
+    iptables -A TRAFFIC_IN -p $proto --dport $port -m comment --comment "$COMMENT"
+    iptables -A TRAFFIC_OUT -p $proto --sport $port -m comment --comment "$COMMENT"
     # IPv6
     if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -D TRAFFIC_IN -p $proto --dport $port -m comment --comment "$COMMENT" 2>/dev/null
-        ip6tables -D TRAFFIC_OUT -p $proto --sport $port -m comment --comment "$COMMENT" 2>/dev/null
+        ip6tables -A TRAFFIC_IN -p $proto --dport $port -m comment --comment "$COMMENT"
+        ip6tables -A TRAFFIC_OUT -p $proto --sport $port -m comment --comment "$COMMENT"
     fi
-    log "删除监控端口：$port/$proto (IPv4+IPv6)"
+    log "添加监控端口：$port/$proto (IPv4+IPv6)"
 }
 
 # 获取所有监控端口列表（从配置文件）
