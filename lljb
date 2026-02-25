@@ -16,6 +16,7 @@ readonly PID_FILE="/var/run/lljb.pid"
 readonly LOG_FILE="/var/log/lljb.log"
 readonly COMMENT="lljb-managed"
 readonly DAEMON_INTERVAL=30  # 轮询间隔（秒）
+readonly TOTAL_FILE="$CONFIG_DIR/total.db"
 
 # ---------- 颜色输出 ----------
 RED='\033[0;31m'
@@ -42,7 +43,7 @@ check_root() {
 
 init_config() {
     mkdir -p "$CONFIG_DIR"
-    touch "$PORTS_FILE" "$TRAFFIC_FILE" "$LAST_COUNTER_FILE" "$LOG_FILE"
+    touch "$PORTS_FILE" "$TRAFFIC_FILE" "$LAST_COUNTER_FILE" "$TOTAL_FILE" "$LOG_FILE"
 }
 
 # 获取 SSH 端口（从配置文件或默认22）
@@ -132,6 +133,20 @@ get_monitored_ports() {
     fi
 }
 
+# 获取所有非回环接口的总入站和出站字节数
+get_total_traffic() {
+    local in=0 out=0
+    while read -r line; do
+        # 跳过标题行和回环接口
+        [[ "$line" =~ ^[[:space:]]*face|^[[:space:]]*lo: ]] && continue
+        if [[ "$line" =~ ^[[:space:]]*[^:]+:[[:space:]]*([0-9]+)[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+([0-9]+) ]]; then
+            in=$((in + ${BASH_REMATCH[1]}))
+            out=$((out + ${BASH_REMATCH[2]}))
+        fi
+    done < /proc/net/dev
+    echo "$in $out"
+}
+
 # 获取所有端口的当前原始计数（字节）
 get_raw_counters() {
     # IPv4 计数
@@ -185,53 +200,123 @@ format_bytes() {
 
 # 获取当天0点的时间戳（秒）
 get_today_midnight() {
-    date -d "0:00" +%s
+    echo $(( $(date +%s) - $(date +%H)*3600 - $(date +%M)*60 - $(date +%S) ))
 }
 
 # ---------- 守护进程 ----------
 daemon() {
+    # 避免重复启动
     if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
         exit 0
     fi
     echo $$ > "$PID_FILE"
     trap 'rm -f "$PID_FILE"; exit' EXIT INT TERM
 
-    init_config
+    # 初始化配置目录和文件
+    mkdir -p "$CONFIG_DIR"
+    touch "$PORTS_FILE" "$TRAFFIC_FILE" "$LAST_COUNTER_FILE" "$TOTAL_FILE" "$LOG_FILE"
+
+    # 创建自定义链（IPv4 + IPv6）
     create_custom_chains
 
+    # 从配置文件加载监控端口，并确保规则存在
     while read -r port; do
         [ -z "$port" ] && continue
         add_monitor_rule "$port" tcp
         add_monitor_rule "$port" udp
     done < "$PORTS_FILE"
 
+    # 初始化上次计数文件（如果不存在）
     if [ ! -s "$LAST_COUNTER_FILE" ]; then
         get_raw_counters > "$LAST_COUNTER_FILE"
         echo "TIMESTAMP=$(date +%s)" >> "$LAST_COUNTER_FILE"
         > "$TRAFFIC_FILE"
     fi
 
+    # ---------- 总流量统计初始化 ----------
+    # TOTAL_FILE 格式：累计入站 累计出站 上次原始入站 上次原始出站
+    if [ ! -f "$TOTAL_FILE" ]; then
+        echo "0 0 0 0" > "$TOTAL_FILE"
+    fi
+
+    # 获取当前总流量原始值
+    get_total_traffic() {
+        local in=0 out=0
+        while read -r line; do
+            # 跳过标题行和回环接口
+            [[ "$line" =~ ^[[:space:]]*face|^[[:space:]]*lo: ]] && continue
+            if [[ "$line" =~ ^[[:space:]]*[^:]+:[[:space:]]*([0-9]+)[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+([0-9]+) ]]; then
+                in=$((in + ${BASH_REMATCH[1]}))
+                out=$((out + ${BASH_REMATCH[2]}))
+            fi
+        done < /proc/net/dev
+        echo "$in $out"
+    }
+
+    # ---------- 主循环 ----------
     while true; do
         sleep $DAEMON_INTERVAL
 
+        # 获取当前原始端口计数
+        current_raw=$(get_raw_counters)
+        current_ts=$(date +%s)
+
+        # 读取上次端口计数和时间戳
         if [ -f "$LAST_COUNTER_FILE" ]; then
             eval $(grep -E "^TIMESTAMP=" "$LAST_COUNTER_FILE")
             last_ts=${TIMESTAMP:-0}
             cp "$LAST_COUNTER_FILE" "${LAST_COUNTER_FILE}.old"
         else
+            last_ts=0
             continue
         fi
 
-        current_raw=$(get_raw_counters)
-        current_ts=$(date +%s)
+        # 计算今天的零点时间戳（用于判断跨天）
+        today_midnight=$(get_today_midnight)
 
-        if [ $(date -d @$last_ts +%Y%m%d) != $(date -d @$current_ts +%Y%m%d) ]; then
+        # ---------- 总流量统计 ----------
+        # 读取 TOTAL_FILE
+        read -r total_accum_in total_accum_out last_raw_in last_raw_out < "$TOTAL_FILE"
+        # 获取当前原始总流量
+        read -r curr_raw_in curr_raw_out <<< $(get_total_traffic)
+
+        # 判断是否跨天
+        if [ $last_ts -lt $today_midnight ]; then
+            # 跨天：重置累计值，并用当前原始值作为新的基准
+            total_accum_in=0
+            total_accum_out=0
+            last_raw_in=$curr_raw_in
+            last_raw_out=$curr_raw_out
+            log "总流量跨天重置"
+        else
+            # 非跨天：计算增量
+            delta_in=$((curr_raw_in - last_raw_in))
+            delta_out=$((curr_raw_out - last_raw_out))
+            if [ $delta_in -lt 0 ] || [ $delta_out -lt 0 ]; then
+                # 可能是计数器回绕或数据异常，重置基准
+                log "总流量计数器异常，重置基准"
+                last_raw_in=$curr_raw_in
+                last_raw_out=$curr_raw_out
+            else
+                total_accum_in=$((total_accum_in + delta_in))
+                total_accum_out=$((total_accum_out + delta_out))
+                last_raw_in=$curr_raw_in
+                last_raw_out=$curr_raw_out
+            fi
+        fi
+        # 写入更新后的累计值和基准值
+        echo "$total_accum_in $total_accum_out $last_raw_in $last_raw_out" > "$TOTAL_FILE"
+
+        # ---------- 端口流量统计（原有逻辑，但跨天判断改用 today_midnight）----------
+        if [ $last_ts -lt $today_midnight ]; then
+            # 跨天：重置端口流量文件
             > "$TRAFFIC_FILE"
             echo "$current_raw" > "$LAST_COUNTER_FILE"
             echo "TIMESTAMP=$current_ts" >> "$LAST_COUNTER_FILE"
             continue
         fi
 
+        # 解析当前端口计数
         declare -A current_in current_out
         while IFS=: read -r proto dir port bytes; do
             if [ "$dir" = "in" ]; then
@@ -241,6 +326,7 @@ daemon() {
             fi
         done <<< "$current_raw"
 
+        # 解析上次端口计数
         declare -A last_in last_out
         while IFS=: read -r proto dir port bytes; do
             if [ "$dir" = "in" ]; then
@@ -250,6 +336,7 @@ daemon() {
             fi
         done < <(grep -v "^TIMESTAMP=" "${LAST_COUNTER_FILE}.old")
 
+        # 计算增量并更新端口流量文件
         > "${TRAFFIC_FILE}.tmp"
         for key in "${!current_in[@]}"; do
             proto=${key%%:*}
@@ -283,6 +370,7 @@ daemon() {
         fi
         rm -f "${TRAFFIC_FILE}.tmp"
 
+        # 更新上次计数文件
         echo "$current_raw" > "$LAST_COUNTER_FILE"
         echo "TIMESTAMP=$current_ts" >> "$LAST_COUNTER_FILE"
         rm -f "${LAST_COUNTER_FILE}.old"
@@ -375,22 +463,16 @@ show_port_traffic() {
 # 显示总流量
 show_total_traffic() {
     clear
-    echo -e "${BLUE}--- 总流量使用量 (当日累计) ---${NC}"
-    total_in=0
-    total_out=0
-    if [ -f "$TRAFFIC_FILE" ]; then
-        while IFS=: read -r proto dir port bytes; do
-            if [ "$dir" = "in" ]; then
-                total_in=$((total_in + bytes))
-            else
-                total_out=$((total_out + bytes))
-            fi
-        done < "$TRAFFIC_FILE"
+    echo -e "${BLUE}--- 主机总流量使用量 (当日累计) ---${NC}"
+    if [ -f "$TOTAL_FILE" ]; then
+        read -r total_in total_out < "$TOTAL_FILE"
+        total=$((total_in + total_out))
+        echo "总下载(入站): $(format_bytes $total_in)"
+        echo "总上传(出站): $(format_bytes $total_out)"
+        echo "总计: $(format_bytes $total)"
+    else
+        echo "暂无数据，请稍后重试。"
     fi
-    total=$((total_in + total_out))
-    echo "总下载(入站): $(format_bytes $total_in)"
-    echo "总上传(出站): $(format_bytes $total_out)"
-    echo "总计: $(format_bytes $total)"
     echo ""
     read -p "按回车键返回菜单..."
 }
