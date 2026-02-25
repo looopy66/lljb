@@ -24,6 +24,7 @@ readonly NFT_FORWARD_CHAIN="forward_filter"           # 转发规则链
 readonly LOG_FILE="/var/log/lljb.log"                 # 日志文件
 readonly TRAFFIC_STATS_FILE="$CONFIG_DIR/traffic_stats.json"  # 流量累计数据文件
 readonly BACKUP_FILE="/tmp/lljb_nft_backup.nft"       # 卸载时备份
+readonly PID_FILE="/var/run/lljb.pid"
 
 # ---------- 辅助函数 ----------
 log() {
@@ -1097,7 +1098,9 @@ init() {
     done < "$PORTS_FILE"
 
     # 启动守护进程（后台）
+    if [ ! -f "$PID_FILE" ] || ! kill -0 $(cat "$PID_FILE") 2>/dev/null; then
     nohup "$0" --daemon >/dev/null 2>&1 &
+fi
 }
 
 # ---------- 主入口 ----------
