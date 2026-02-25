@@ -766,12 +766,12 @@ show_total_traffic() {
     read -p "按回车键返回菜单..."
 }
 
-# 显示当前活跃端口及进程（用于参考）
+# 显示当前活跃端口及进程（跨平台版，从 /proc 读取进程名）
 show_active_ports() {
     echo -e "${BLUE}--- 当前活跃端口及进程 ---${NC}"
     printf "%-8s %-8s %-12s %-8s %s\n" "协议" "端口" "状态" "PID" "进程名"
 
-    # 显示所有监听端口
+    # 监听端口
     ss -tulnp 2>/dev/null | awk 'NR>1 {
         split($5, addr, ":");
         port = addr[length(addr)];
@@ -783,15 +783,17 @@ show_active_ports() {
             gsub(/.*pid=/, "", pid_info);
             split(pid_info, a, ",");
             pid = a[1];
-        }
-        if (pid_info ~ /users:/) {
-            n = split(pid_info, arr, "\"");
-            if (n >= 2) proc = arr[2];
+            # 从 /proc 读取进程名
+            if (pid != "-") {
+                cmd = "cat /proc/" pid "/comm 2>/dev/null"
+                cmd | getline proc
+                close(cmd)
+            }
         }
         printf "%-8s %-8s %-12s %-8s %s\n", proto, port, state, pid, proc;
     }'
 
-    # 显示已建立的连接（本地端口）
+    # 已建立连接
     ss -tpn 2>/dev/null | grep ESTAB | awk '{
         split($5, addr, ":");
         port = addr[length(addr)];
@@ -803,16 +805,17 @@ show_active_ports() {
             gsub(/.*pid=/, "", pid_info);
             split(pid_info, a, ",");
             pid = a[1];
-        }
-        if (pid_info ~ /users:/) {
-            n = split(pid_info, arr, "\"");
-            if (n >= 2) proc = arr[2];
+            if (pid != "-") {
+                cmd = "cat /proc/" pid "/comm 2>/dev/null"
+                cmd | getline proc
+                close(cmd)
+            }
         }
         printf "%-8s %-8s %-12s %-8s %s\n", proto, port, state, pid, proc;
     }' | sort -u
 
     echo "----------------------------------------"
-    echo -e "${YELLOW}提示：部分进程可能无法显示，可使用 'lsof -i :端口号' 手动查询。${NC}"
+    echo -e "${YELLOW}提示：若进程名仍为“-”，可能进程已退出或无权限读取。${NC}"
 }
 
 add_port() {
