@@ -355,6 +355,7 @@ add_accept_interactive() {
 
 modify_accept() {
     clear
+    show_active_ports
     echo -e "${BLUE}--- 修改放行端口 ---${NC}"
     echo "当前放行规则（包含 ACCEPT）："
     nft list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | grep "accept" | grep "$COMMENT" || echo "无放行规则"
@@ -374,6 +375,7 @@ modify_accept() {
 
 modify_drop() {
     clear
+    show_active_ports
     echo -e "${BLUE}--- 修改拒绝端口 ---${NC}"
     echo "当前拒绝规则（包含 drop）："
     nft list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | grep "drop" | grep "$COMMENT" || echo "无拒绝规则"
@@ -764,8 +766,58 @@ show_total_traffic() {
     read -p "按回车键返回菜单..."
 }
 
+# 显示当前活跃端口及进程（用于参考）
+show_active_ports() {
+    echo -e "${BLUE}--- 当前活跃端口及进程 ---${NC}"
+    printf "%-8s %-8s %-12s %-8s %s\n" "协议" "端口" "状态" "PID" "进程名"
+
+    # 显示所有监听端口
+    ss -tulnp 2>/dev/null | awk 'NR>1 {
+        split($5, addr, ":");
+        port = addr[length(addr)];
+        proto = $1;
+        state = "LISTEN";
+        pid_info = $7;
+        pid = "-"; proc = "-";
+        if (pid_info ~ /pid=/) {
+            gsub(/.*pid=/, "", pid_info);
+            split(pid_info, a, ",");
+            pid = a[1];
+        }
+        if (pid_info ~ /users:/) {
+            n = split(pid_info, arr, "\"");
+            if (n >= 2) proc = arr[2];
+        }
+        printf "%-8s %-8s %-12s %-8s %s\n", proto, port, state, pid, proc;
+    }'
+
+    # 显示已建立的连接（本地端口）
+    ss -tpn 2>/dev/null | grep ESTAB | awk '{
+        split($5, addr, ":");
+        port = addr[length(addr)];
+        proto = $1;
+        state = "ESTAB";
+        pid_info = $6;
+        pid = "-"; proc = "-";
+        if (pid_info ~ /pid=/) {
+            gsub(/.*pid=/, "", pid_info);
+            split(pid_info, a, ",");
+            pid = a[1];
+        }
+        if (pid_info ~ /users:/) {
+            n = split(pid_info, arr, "\"");
+            if (n >= 2) proc = arr[2];
+        }
+        printf "%-8s %-8s %-12s %-8s %s\n", proto, port, state, pid, proc;
+    }' | sort -u
+
+    echo "----------------------------------------"
+    echo -e "${YELLOW}提示：部分进程可能无法显示，可使用 'lsof -i :端口号' 手动查询。${NC}"
+}
+
 add_port() {
     clear
+    show_active_ports   # 新增
     echo -e "${BLUE}--- 增加监听端口 ---${NC}"
     read -p "请输入要监控的端口号（可多个，用空格分隔）: " -a ports
     if [ ${#ports[@]} -eq 0 ]; then
@@ -793,6 +845,7 @@ add_port() {
 
 remove_port() {
     clear
+    show_active_ports
     echo -e "${BLUE}--- 删除监听端口 ---${NC}"
     monitored=$(get_monitored_ports)
     if [ -z "$monitored" ]; then
