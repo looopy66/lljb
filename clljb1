@@ -1,0 +1,696 @@
+#!/bin/bash
+# lljb - 轻量级端口流量监控工具 (纯监测版)
+# 版本：2.5 (增加菜单1的流量变化显示)
+# 适用系统：Ubuntu/Debian/Alpine (需支持 nftables 和 vnstat)
+
+set -euo pipefail
+
+# ---------- 颜色输出 ----------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# ---------- 全局配置 ----------
+readonly CONFIG_DIR="/etc/lljb"
+readonly PORTS_FILE="$CONFIG_DIR/ports.conf"          # 监控的端口列表
+readonly COMMENT="lljb-managed"                        # nftables 规则注释（仅用于计数器）
+readonly NFT_TABLE="lljb"                              # nftables 表名
+readonly NFT_INPUT_CHAIN="input_filter"                # 入站规则链
+readonly NFT_OUTPUT_CHAIN="output_filter"              # 出站规则链
+readonly NFT_FORWARD_CHAIN="forward_filter"            # 转发规则链
+readonly LOG_FILE="/var/log/lljb.log"                  # 日志文件
+readonly TRAFFIC_STATS_FILE="$CONFIG_DIR/traffic_stats.json"  # 流量累计数据文件
+readonly LAST_QUERY_FILE="$CONFIG_DIR/last_query.json"        # 上一次查询的流量快照
+readonly BACKUP_FILE="/tmp/lljb_nft_backup.nft"        # 卸载时备份
+readonly PID_FILE="/var/run/lljb.pid"                  # 守护进程 PID 文件
+
+# ---------- 辅助函数 ----------
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+error_exit() {
+    echo -e "${RED}错误：$1${NC}" >&2
+    exit 1
+}
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        error_exit "请以 root 权限运行此脚本。"
+    fi
+}
+
+# ---------- 系统检测与依赖安装 ----------
+detect_system() {
+    if [ -f /etc/alpine-release ]; then
+        echo "alpine"
+    elif [ -f /etc/debian_version ]; then
+        echo "debian"
+    else
+        echo "unknown"
+    fi
+}
+
+install_dependencies() {
+    local missing=()
+    for cmd in nft vnstat bc jq; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing+=("$cmd")
+        fi
+    done
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    echo -e "${YELLOW}检测到缺少依赖: ${missing[*]}，正在安装...${NC}"
+    local sys=$(detect_system)
+
+    case "$sys" in
+        debian)
+            apt-get update -qq
+            for pkg in "${missing[@]}"; do
+                case "$pkg" in
+                    nft)      apt-get install -y nftables ;;
+                    vnstat)   apt-get install -y vnstat ;;
+                    bc)       apt-get install -y bc ;;
+                    jq)       apt-get install -y jq ;;
+                esac
+            done
+            systemctl enable vnstat --now 2>/dev/null || service vnstat start 2>/dev/null || true
+            ;;
+        alpine)
+            apk update
+            for pkg in "${missing[@]}"; do
+                case "$pkg" in
+                    nft)      apk add nftables ;;
+                    vnstat)   apk add vnstat ;;
+                    bc)       apk add bc ;;
+                    jq)       apk add jq ;;
+                esac
+            done
+            rc-update add vnstat default 2>/dev/null || true
+            rc-service vnstat start 2>/dev/null || true
+            ;;
+        *)
+            echo -e "${RED}不支持的系统类型，请手动安装依赖: ${missing[*]}${NC}"
+            exit 1
+            ;;
+    esac
+    echo -e "${GREEN}依赖安装完成${NC}"
+}
+
+# ---------- nftables 初始化 ----------
+init_nftables() {
+    nft add table inet "$NFT_TABLE" 2>/dev/null || true
+    nft add chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" { type filter hook input priority 0\; } 2>/dev/null || true
+    nft add chain inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" { type filter hook output priority 0\; } 2>/dev/null || true
+    nft add chain inet "$NFT_TABLE" "$NFT_FORWARD_CHAIN" { type filter hook forward priority 0\; } 2>/dev/null || true
+    log "nftables 初始化完成"
+}
+
+# ---------- 端口监控计数器操作（仅统计，不影响防火墙策略）----------
+add_port_counter() {
+    local port=$1
+    local proto=$2
+    nft insert rule inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" $proto dport $port counter comment \"$COMMENT\" 2>/dev/null || true
+    nft insert rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" $proto sport $port counter comment \"$COMMENT\" 2>/dev/null || true
+    nft insert rule inet "$NFT_TABLE" "$NFT_FORWARD_CHAIN" $proto dport $port counter comment \"$COMMENT\" 2>/dev/null || true
+    nft insert rule inet "$NFT_TABLE" "$NFT_FORWARD_CHAIN" $proto sport $port counter comment \"$COMMENT\" 2>/dev/null || true
+    log "添加监控端口：$port/$proto (所有链)"
+}
+
+remove_port_counter() {
+    local port=$1
+    local proto=$2
+    local in_handle=$(nft -a list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | \
+        grep "$proto dport $port counter" | grep "$COMMENT" | awk '{print $NF}')
+    [ -n "$in_handle" ] && nft delete rule inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" handle $in_handle 2>/dev/null || true
+    local out_handle=$(nft -a list chain inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" 2>/dev/null | \
+        grep "$proto sport $port counter" | grep "$COMMENT" | awk '{print $NF}')
+    [ -n "$out_handle" ] && nft delete rule inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" handle $out_handle 2>/dev/null || true
+    local fwd_in_handle=$(nft -a list chain inet "$NFT_TABLE" "$NFT_FORWARD_CHAIN" 2>/dev/null | \
+        grep "$proto dport $port counter" | grep "$COMMENT" | awk '{print $NF}')
+    [ -n "$fwd_in_handle" ] && nft delete rule inet "$NFT_TABLE" "$NFT_FORWARD_CHAIN" handle $fwd_in_handle 2>/dev/null || true
+    local fwd_out_handle=$(nft -a list chain inet "$NFT_TABLE" "$NFT_FORWARD_CHAIN" 2>/dev/null | \
+        grep "$proto sport $port counter" | grep "$COMMENT" | awk '{print $NF}')
+    [ -n "$fwd_out_handle" ] && nft delete rule inet "$NFT_TABLE" "$NFT_FORWARD_CHAIN" handle $fwd_out_handle 2>/dev/null || true
+    log "删除监控端口：$port/$proto"
+}
+
+# ---------- 从 nftables 规则中读取当前计数器值（实时）----------
+get_current_port_counts() {
+    # 输出格式：proto:in:port:bytes  和 proto:out:port:bytes
+    nft list chain inet "$NFT_TABLE" "$NFT_INPUT_CHAIN" 2>/dev/null | awk -v table="$NFT_TABLE" -v chain="$NFT_INPUT_CHAIN" '
+        /counter/ && /dport/ && /lljb-managed/ {
+            match($0, /([a-z]+) dport ([0-9]+)/, arr)
+            if (arr[1] && arr[2]) {
+                proto = arr[1]
+                port = arr[2]
+                for (i=1; i<=NF; i++) {
+                    if ($i == "bytes") {
+                        bytes = $(i+1)
+                        gsub(/[^0-9]/, "", bytes)
+                        break
+                    }
+                }
+                print proto":in:"port":"bytes
+            }
+        }
+    '
+    nft list chain inet "$NFT_TABLE" "$NFT_FORWARD_CHAIN" 2>/dev/null | awk -v table="$NFT_TABLE" -v chain="$NFT_FORWARD_CHAIN" '
+        /counter/ && /dport/ && /lljb-managed/ {
+            match($0, /([a-z]+) dport ([0-9]+)/, arr)
+            if (arr[1] && arr[2]) {
+                proto = arr[1]
+                port = arr[2]
+                for (i=1; i<=NF; i++) {
+                    if ($i == "bytes") {
+                        bytes = $(i+1)
+                        gsub(/[^0-9]/, "", bytes)
+                        break
+                    }
+                }
+                print proto":in:"port":"bytes
+            }
+        }
+    '
+    nft list chain inet "$NFT_TABLE" "$NFT_OUTPUT_CHAIN" 2>/dev/null | awk -v table="$NFT_TABLE" -v chain="$NFT_OUTPUT_CHAIN" '
+        /counter/ && /sport/ && /lljb-managed/ {
+            match($0, /([a-z]+) sport ([0-9]+)/, arr)
+            if (arr[1] && arr[2]) {
+                proto = arr[1]
+                port = arr[2]
+                for (i=1; i<=NF; i++) {
+                    if ($i == "bytes") {
+                        bytes = $(i+1)
+                        gsub(/[^0-9]/, "", bytes)
+                        break
+                    }
+                }
+                print proto":out:"port":"bytes
+            }
+        }
+    '
+    nft list chain inet "$NFT_TABLE" "$NFT_FORWARD_CHAIN" 2>/dev/null | awk -v table="$NFT_TABLE" -v chain="$NFT_FORWARD_CHAIN" '
+        /counter/ && /sport/ && /lljb-managed/ {
+            match($0, /([a-z]+) sport ([0-9]+)/, arr)
+            if (arr[1] && arr[2]) {
+                proto = arr[1]
+                port = arr[2]
+                for (i=1; i<=NF; i++) {
+                    if ($i == "bytes") {
+                        bytes = $(i+1)
+                        gsub(/[^0-9]/, "", bytes)
+                        break
+                    }
+                }
+                print proto":out:"port":"bytes
+            }
+        }
+    '
+}
+
+# ---------- JSON 流量持久化 ----------
+init_traffic_stats() {
+    if [ ! -f "$TRAFFIC_STATS_FILE" ]; then
+        echo '{}' > "$TRAFFIC_STATS_FILE"
+    fi
+    if [ ! -f "$LAST_QUERY_FILE" ]; then
+        echo '{}' > "$LAST_QUERY_FILE"
+    fi
+}
+
+update_port_stats() {
+    local port=$1
+    local in_bytes=$2
+    local out_bytes=$3
+    jq --arg port "$port" \
+       --argjson in "$in_bytes" \
+       --argjson out "$out_bytes" \
+       '.[$port] = {in: $in, out: $out}' \
+       "$TRAFFIC_STATS_FILE" > "${TRAFFIC_STATS_FILE}.tmp" && \
+    mv "${TRAFFIC_STATS_FILE}.tmp" "$TRAFFIC_STATS_FILE"
+}
+
+get_port_stats() {
+    local port=$1
+    local in_bytes=$(jq -r --arg port "$port" '.[$port].in // 0' "$TRAFFIC_STATS_FILE")
+    local out_bytes=$(jq -r --arg port "$port" '.[$port].out // 0' "$TRAFFIC_STATS_FILE")
+    echo "$in_bytes $out_bytes"
+}
+
+# ---------- 获取监控端口列表 ----------
+get_monitored_ports() {
+    if [ -f "$PORTS_FILE" ]; then
+        cat "$PORTS_FILE"
+    fi
+}
+
+# ---------- 字节数格式化 ----------
+format_bytes() {
+    local bytes=$1
+    if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
+        bytes=0
+    fi
+    if [ $bytes -ge 1073741824 ]; then
+        echo "$(echo "scale=2; $bytes/1073741824" | bc 2>/dev/null || echo "0.00")GB"
+    elif [ $bytes -ge 1048576 ]; then
+        echo "$(echo "scale=2; $bytes/1048576" | bc 2>/dev/null || echo "0.00")MB"
+    elif [ $bytes -ge 1024 ]; then
+        echo "$(echo "scale=2; $bytes/1024" | bc 2>/dev/null || echo "0.00")KB"
+    else
+        echo "${bytes}B"
+    fi
+}
+
+# ---------- 重置端口计数器 ----------
+reset_port_counters() {
+    clear
+    echo -e "${BLUE}--- 重置端口流量计数器 ---${NC}"
+    local ports=($(get_monitored_ports))
+    if [ ${#ports[@]} -eq 0 ]; then
+        echo "当前没有监控任何端口。"
+    else
+        echo "将重置以下端口的流量累计值："
+        printf "%s " "${ports[@]}"
+        echo ""
+        read -p "确认重置？[y/N]: " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            for port in "${ports[@]}"; do
+                remove_port_counter "$port" tcp
+                remove_port_counter "$port" udp
+                add_port_counter "$port" tcp
+                add_port_counter "$port" udp
+                update_port_stats "$port" 0 0
+                # 重置 last_query 中该端口为0
+                jq --arg port "$port" '.[$port] = {tcp: {in: 0, out: 0}, udp: {in: 0, out: 0}}' "$LAST_QUERY_FILE" > "${LAST_QUERY_FILE}.tmp" && mv "${LAST_QUERY_FILE}.tmp" "$LAST_QUERY_FILE"
+                echo -e "${GREEN}端口 $port 计数器已重置${NC}"
+            done
+            echo -e "${GREEN}所有监控端口计数器已清零。${NC}"
+        else
+            echo "取消重置。"
+        fi
+    fi
+    read -p "按回车键返回..."
+}
+
+# ---------- 活跃端口显示 ----------
+show_active_ports() {
+    echo -e "${BLUE}--- 当前活跃端口及进程 ---${NC}"
+    printf "%-8s %-8s %-12s %-8s %s\n" "协议" "端口" "状态" "PID" "进程名"
+
+    ss -tulnp 2>/dev/null | awk 'NR>1 {
+        split($5, addr, ":");
+        port = addr[length(addr)];
+        proto = $1;
+        state = "LISTEN";
+        pid_info = $7;
+        pid = "-"; proc = "-";
+        if (pid_info ~ /pid=/) {
+            gsub(/.*pid=/, "", pid_info);
+            split(pid_info, a, ",");
+            pid = a[1];
+            if (pid != "-") {
+                cmd = "cat /proc/" pid "/comm 2>/dev/null"
+                cmd | getline proc
+                close(cmd)
+            }
+        }
+        printf "%-8s %-8s %-12s %-8s %s\n", proto, port, state, pid, proc;
+    }'
+
+    ss -tpn 2>/dev/null | grep ESTAB | awk '{
+        split($5, addr, ":");
+        port = addr[length(addr)];
+        proto = $1;
+        state = "ESTAB";
+        pid_info = $6;
+        pid = "-"; proc = "-";
+        if (pid_info ~ /pid=/) {
+            gsub(/.*pid=/, "", pid_info);
+            split(pid_info, a, ",");
+            pid = a[1];
+            if (pid != "-") {
+                cmd = "cat /proc/" pid "/comm 2>/dev/null"
+                cmd | getline proc
+                close(cmd)
+            }
+        }
+        printf "%-8s %-8s %-12s %-8s %s\n", proto, port, state, pid, proc;
+    }' | sort -u
+
+    echo "----------------------------------------"
+    echo -e "${YELLOW}提示：若进程名仍为“-”，可能进程已退出或无权限读取。${NC}"
+}
+
+# ---------- 端口流量显示（实时 + 较上次变化）----------
+show_port_traffic() {
+    clear
+    echo -e "${BLUE}--- 监听端口流量使用量 (实时) ---${NC}"
+    local ports=($(get_monitored_ports))
+    if [ ${#ports[@]} -eq 0 ]; then
+        echo "暂无监控端口。"
+    else
+        local current_counts=$(get_current_port_counts)
+        declare -A cur_in cur_out
+        while IFS=: read -r proto dir port bytes; do
+            key="${port}:${proto}"
+            if [ "$dir" = "in" ]; then
+                cur_in["$key"]=$(( ${cur_in["$key"]:-0} + bytes ))
+            else
+                cur_out["$key"]=$(( ${cur_out["$key"]:-0} + bytes ))
+            fi
+        done <<< "$current_counts"
+
+        # 读取上次查询数据
+        local last_data=$(cat "$LAST_QUERY_FILE" 2>/dev/null || echo '{}')
+        # 准备更新数据（初始为空对象）
+        local new_data="{}"
+        printf "%-10s %-8s %-25s %-25s\n" "端口" "协议" "当前下载/上传" "较上次变化"
+        echo "------------------------------------------------------------------------------------------"
+
+        for port in "${ports[@]}"; do
+            for proto in tcp udp; do
+                key="${port}:${proto}"
+                cur_in_val=${cur_in["$key"]:-0}
+                cur_out_val=${cur_out["$key"]:-0}
+
+                # 获取上次值
+                last_in_val=$(echo "$last_data" | jq -r --arg port "$port" --arg proto "$proto" '.[$port][$proto].in // 0')
+                last_out_val=$(echo "$last_data" | jq -r --arg port "$port" --arg proto "$proto" '.[$port][$proto].out // 0')
+
+                # 计算差值（处理计数器重置：若当前小于上次，则视为重置，差值 = 当前值）
+                if [ "$cur_in_val" -lt "$last_in_val" ]; then
+                    delta_in=$cur_in_val
+                else
+                    delta_in=$((cur_in_val - last_in_val))
+                fi
+                if [ "$cur_out_val" -lt "$last_out_val" ]; then
+                    delta_out=$cur_out_val
+                else
+                    delta_out=$((cur_out_val - last_out_val))
+                fi
+
+                # 仅当当前有流量时才显示（保持原风格）
+                if [ $cur_in_val -gt 0 ] || [ $cur_out_val -gt 0 ]; then
+                    current_str="$(format_bytes $cur_in_val) / $(format_bytes $cur_out_val)"
+                    delta_str="+$(format_bytes $delta_in) / +$(format_bytes $delta_out)"
+                    printf "%-10s %-8s %-25s %-25s\n" "$port" "$proto" "$current_str" "$delta_str"
+                fi
+
+                # 更新 new_data 中的该端口协议值（即使为0也更新）
+                new_data=$(echo "$new_data" | jq --arg port "$port" --arg proto "$proto" \
+                    --argjson in "$cur_in_val" --argjson out "$cur_out_val" \
+                    '.[$port] = (.[$port] // {}) | .[$port][$proto] = {in: $in, out: $out}')
+            done
+        done
+
+        # 将本次查询结果写入文件，作为下次的上次值
+        echo "$new_data" > "$LAST_QUERY_FILE.tmp" && mv "$LAST_QUERY_FILE.tmp" "$LAST_QUERY_FILE"
+    fi
+    echo ""
+    read -p "按回车键返回菜单..."
+}
+
+# ---------- 总流量显示（vnstat）----------
+show_total_traffic() {
+    clear
+    echo -e "${BLUE}--- 主机总流量使用量 (当日累计) ---${NC}"
+    if command -v vnstat >/dev/null 2>&1; then
+        local out
+        out=$(vnstat -d --oneline 2>/dev/null | head -1)
+        if [ -n "$out" ]; then
+            IFS=';' read -r iface date in_val in_unit out_val out_unit rest <<< "$out"
+            if [ -n "$in_val" ] && [ -n "$out_val" ]; then
+                echo "总下载(入站): $in_val $in_unit"
+                echo "总上传(出站): $out_val $out_unit"
+            else
+                echo "vnstat 数据格式异常，请检查数据库。"
+            fi
+        else
+            echo "vnstat 尚未收集到数据，请稍后再试。"
+        fi
+    else
+        echo "vnstat 未安装，无法显示流量。"
+    fi
+    echo ""
+    read -p "按回车键返回菜单..."
+}
+
+# ---------- 增加监听端口 ----------
+add_port() {
+    clear
+    show_active_ports
+    echo -e "${BLUE}--- 增加监听端口 ---${NC}"
+    echo -e "你可以输入端口号（可多个，空格分隔），或输入 ${YELLOW}all${NC} 一键监控所有当前监听端口。"
+    read -p "请输入: " -a inputs
+    if [ ${#inputs[@]} -eq 0 ]; then
+        echo -e "${RED}未输入任何内容${NC}"
+        sleep 1
+        return
+    fi
+
+    # 检查是否输入了 "all"
+    local all_mode=0
+    for item in "${inputs[@]}"; do
+        if [[ "${item,,}" == "all" ]]; then
+            all_mode=1
+            break
+        fi
+    done
+
+    local ports=()
+    if [ $all_mode -eq 1 ]; then
+        echo -e "${YELLOW}正在获取所有监听端口...${NC}"
+        # 获取所有监听端口（TCP和UDP），提取端口号并去重
+        ports=( $(ss -tuln 2>/dev/null | awk 'NR>1 { split($5, a, ":"); port = a[length(a)]; if (port ~ /^[0-9]+$/) print port }' | sort -nu) )
+        if [ ${#ports[@]} -eq 0 ]; then
+            echo -e "${RED}未检测到任何监听端口。${NC}"
+            read -p "按回车键返回..."
+            return
+        fi
+        echo -e "将监控以下 ${#ports[@]} 个端口："
+        echo "${ports[@]}"
+        read -p "确认添加？[y/N]: " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "取消添加。"
+            read -p "按回车键返回..."
+            return
+        fi
+    else
+        ports=("${inputs[@]}")
+    fi
+
+    for port in "${ports[@]}"; do
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            echo -e "${RED}跳过无效端口: $port${NC}"
+            continue
+        fi
+        if grep -qx "$port" "$PORTS_FILE" 2>/dev/null; then
+            echo -e "${YELLOW}端口 $port 已在监控列表中${NC}"
+            continue
+        fi
+        echo "$port" >> "$PORTS_FILE"
+        add_port_counter "$port" tcp
+        add_port_counter "$port" udp
+        update_port_stats "$port" 0 0
+        # 初始化 last_query 中该端口为0
+        jq --arg port "$port" '.[$port] = {tcp: {in: 0, out: 0}, udp: {in: 0, out: 0}}' "$LAST_QUERY_FILE" > "${LAST_QUERY_FILE}.tmp" && mv "${LAST_QUERY_FILE}.tmp" "$LAST_QUERY_FILE"
+        echo -e "${GREEN}端口 $port 已添加监控${NC}"
+    done
+    echo ""
+    read -p "按回车键返回菜单..."
+}
+
+# ---------- 删除监听端口 ----------
+remove_port() {
+    clear
+    show_active_ports
+    echo -e "${BLUE}--- 删除监听端口 ---${NC}"
+    monitored=$(get_monitored_ports)
+    if [ -z "$monitored" ]; then
+        echo "当前没有监控任何端口。"
+        read -p "按回车键返回..."
+        return
+    fi
+
+    echo "当前监控端口:"
+    echo "$monitored" | nl
+    echo -e "你可以输入端口号（可多个，空格分隔），或输入 ${YELLOW}all${NC} 一键删除所有监控端口。"
+    read -p "请输入: " -a inputs
+    if [ ${#inputs[@]} -eq 0 ]; then
+        echo -e "${RED}未输入任何内容${NC}"
+        sleep 1
+        return
+    fi
+
+    # 检查是否输入了 "all"
+    local all_mode=0
+    for item in "${inputs[@]}"; do
+        if [[ "${item,,}" == "all" ]]; then
+            all_mode=1
+            break
+        fi
+    done
+
+    local ports=()
+    if [ $all_mode -eq 1 ]; then
+        ports=( $(echo "$monitored") )
+        if [ ${#ports[@]} -eq 0 ]; then
+            echo "没有可删除的监控端口。"
+            read -p "按回车键返回..."
+            return
+        fi
+        echo -e "将删除以下所有监控端口："
+        echo "${ports[@]}"
+        read -p "确认删除？[y/N]: " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "取消删除。"
+            read -p "按回车键返回..."
+            return
+        fi
+    else
+        ports=("${inputs[@]}")
+    fi
+
+    for port in "${ports[@]}"; do
+        if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}跳过无效端口: $port${NC}"
+            continue
+        fi
+        if grep -qx "$port" "$PORTS_FILE"; then
+            sed -i "/^$port$/d" "$PORTS_FILE"
+            remove_port_counter "$port" tcp
+            remove_port_counter "$port" udp
+            jq --arg port "$port" 'del(.[$port])' "$TRAFFIC_STATS_FILE" > "${TRAFFIC_STATS_FILE}.tmp" && mv "${TRAFFIC_STATS_FILE}.tmp" "$TRAFFIC_STATS_FILE"
+            # 从 last_query 中删除该端口
+            jq --arg port "$port" 'del(.[$port])' "$LAST_QUERY_FILE" > "${LAST_QUERY_FILE}.tmp" && mv "${LAST_QUERY_FILE}.tmp" "$LAST_QUERY_FILE"
+            echo -e "${GREEN}端口 $port 已删除${NC}"
+        else
+            echo -e "${YELLOW}端口 $port 不在监控列表中${NC}"
+        fi
+    done
+    echo ""
+    read -p "按回车键返回菜单..."
+}
+
+# ---------- 守护进程：定期更新 JSON 累计流量 ----------
+daemon() {
+    if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
+        exit 0
+    fi
+    echo $$ > "$PID_FILE"
+    trap 'rm -f "$PID_FILE"; exit' EXIT INT TERM
+
+    init_traffic_stats
+    log "守护进程启动"
+
+    while true; do
+        sleep 60
+        # 暂未实现增量更新，留作未来扩展
+        log "守护进程运行中"
+    done
+}
+
+# ---------- 卸载脚本 ----------
+uninstall_script() {
+    clear
+    echo -e "${RED}警告：此操作将彻底卸载 lljb，并删除所有监控相关的 nftables 规则和配置文件。${NC}"
+    read -p "确认卸载？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        return
+    fi
+
+    # 停止守护进程
+    if [ -f "$PID_FILE" ]; then
+        kill $(cat "$PID_FILE") 2>/dev/null || true
+        rm -f "$PID_FILE"
+    fi
+
+    # 备份当前规则
+    nft list ruleset > "$BACKUP_FILE" 2>/dev/null || true
+    echo "当前 nftables 规则已备份至 $BACKUP_FILE"
+
+    # 删除 lljb 表（移除所有计数器规则）
+    nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+
+    # 删除配置目录和自身
+    rm -rf "$CONFIG_DIR"
+    rm -f "$0"
+
+    echo -e "${GREEN}卸载完成。lljb 已从系统中移除。${NC}"
+    exit 0
+}
+
+# ---------- 主菜单 ----------
+main_menu() {
+    while true; do
+        clear
+        echo -e "${BLUE}=================================${NC}"
+        echo -e "${GREEN}       l l j b   主菜单${NC}"
+        echo -e "${BLUE}=================================${NC}"
+        monitored=$(get_monitored_ports | tr '\n' ' ')
+        if [ -n "$monitored" ]; then
+            echo -e "${YELLOW}当前监控端口:${NC} $monitored"
+        else
+            echo -e "${YELLOW}当前监控端口:${NC} 无"
+        fi
+        echo ""
+        echo "1. 显示监听端口流量使用量"
+        echo "2. 显示总流量使用量 (vnstat)"
+        echo "3. 增加监听端口"
+        echo "4. 删除监听端口"
+        echo "5. 彻底卸载脚本"
+        echo "6. 重置端口流量计数器"
+        echo "0. 退出"
+        echo -e "${BLUE}=================================${NC}"
+        read -p "请选择 [0-6]: " choice
+        case $choice in
+            1) show_port_traffic ;;
+            2) show_total_traffic ;;
+            3) add_port ;;
+            4) remove_port ;;
+            5) uninstall_script ;;
+            6) reset_port_counters ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择，请重试${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# ---------- 初始化 ----------
+init() {
+    mkdir -p "$CONFIG_DIR"
+    touch "$PORTS_FILE" "$LOG_FILE"
+    init_traffic_stats
+    init_nftables
+
+    # 加载已有监控端口
+    while read -r port; do
+        [ -z "$port" ] && continue
+        add_port_counter "$port" tcp 2>/dev/null || true
+        add_port_counter "$port" udp 2>/dev/null || true
+    done < "$PORTS_FILE"
+
+    # 启动守护进程（后台）
+    if [ ! -f "$PID_FILE" ] || ! kill -0 $(cat "$PID_FILE") 2>/dev/null; then
+        nohup "$0" --daemon >/dev/null 2>&1 &
+    fi
+}
+
+# ---------- 主入口 ----------
+main() {
+    check_root
+    install_dependencies
+
+    if [ "${1:-}" = "--daemon" ]; then
+        daemon
+        exit 0
+    fi
+
+    init
+    main_menu
+}
+
+main "$@"
